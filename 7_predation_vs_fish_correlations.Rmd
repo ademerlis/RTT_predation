@@ -1,0 +1,422 @@
+---
+title: "RTT Predation Study - Predation Prevalence"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## load liraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(lme4)
+library(multcomp)
+library(car)
+library(survival)
+library(cowplot)
+library(ggpubr)
+library(survminer)
+library(coxme)
+library(ggsurvfit)
+library(MuMIn)       # for AICc model comparison
+library(DHARMa)      # residual diagnostics
+library(pROC)        # AUC
+library(DescTools)   # Brier score
+library(broom.mixed) # tidy summaries for mixed models
+library(emmeans)   # post-hoc comparisons
+library(glmmTMB)
+library(ggeffects)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+# Set plot aesthetics
+theme_set(theme_classic())
+theme_update(text = element_text(size=14, family = "Helvetica", color = "black"),
+             axis.text = element_text(size=12, family = "Helvetica", color = "black"))
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# Tidying dates for survey time points
+
+# Definitions:
+# SURVEY_MONTH which just means the month the monitoring was done (not accurate dates)
+# Date = exact survey date from fish survey data
+# Middle_MI_date = middle date for each MI across all regions
+
+# all corals were outplanted on May 4-6 2021. 
+# first monitoring for all regions was May 12 or 13, 2021.
+
+# for subsequent MI dates, to ensure that every survey groups together on the same time point (when looking at proportions of total outplants across regions) - pick the middle date for each MI across all regions.
+
+outplant_monitoring_with_dates %>% 
+  dplyr::select(MI_CORRECTED, Date) %>% 
+  distinct() %>% 
+  arrange(Date) %>% 
+  group_by(MI_CORRECTED) %>% 
+  slice(ceiling(n()/2)) %>% 
+  drop_na() %>% 
+  rename(Middle_MI_date = Date) -> middle_date_by_MI
+
+# there will be two types of days calculated - days based on monitoring interval middle date, and exact number of days based on the survey date (from the fish survey data). For any statistical tests using time, use the exact days. Monitoring interval will be reserved for grouping over time, or for visualizations.
+
+left_join(outplant_monitoring_with_dates, middle_date_by_MI, by = c("MI_CORRECTED")) %>% 
+  # use Date if it exists, otherwise Middle_MI_date
+  mutate(Date_Monitored = coalesce(Date, Middle_MI_date)) %>%
+  mutate(Exact_Days = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06"))) %>% 
+  mutate(Days_MI = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))) -> outplant_monitoring_days_survival
+
+# create a column for “experienced predation” - fish bites was Yes and/or % live tissue area due to predation is > 0. Snails = no
+# Then make a column for cumulative predation - once it experienced predation, it gets a yes and then stays yes.
+# To account for multiple bites, use cumulative predation where it counts the total number of predation events - so experienced predation as “yes” converted to a number by the end of the data set
+
+# important to remove snails = yes when incorporating the PRED_1 > 0 filter, because predation % tissue area could be due to the snails. I'm specifically interested in the fish predation in this study, because we don't have a good count or assessment of snail abundance on the reefs where these corals were outplanted.
+
+outplant_monitoring_days_survival %>% 
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>% 
+  group_by(Region, Site, ColonyNumber) %>% 
+  mutate(Experienced_Predation = ifelse((FishBites == "yes" | PRED_1 > 0) & Snails == "no", "1", "0")) %>% 
+  mutate(Cumulative_Predation = ifelse(cumsum(ifelse(Experienced_Predation == "1", 1, 0)) > 0, "1", "0")) %>% 
+  mutate(Total_Predation_Events = cumsum(ifelse(Experienced_Predation == "1", 1, 0))) %>% 
+  ungroup() %>% 
+  mutate(Species = case_when(Species == "MCAV" ~ "M. cavernosa",
+                             Species == "OFAV" ~ "O. faveolata",
+                             Species == "PCLI" ~ "P. clivosa")) %>% 
+   mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) %>% 
+  mutate(Survival = case_when(STATUS_2 == "alive" ~ 1,
+                              STATUS_2 %in% c("dead", "dead_m") ~ 0)) %>% # combine dead and dead_m (missing presumed dead)
+  # note that any "missing" corals will now be NA in Survival column
+  mutate(Species = as.factor(Species),
+         MI_CORRECTED = as.numeric(MI_CORRECTED),
+         Region = as.factor(Region),
+         Site = as.factor(Site),
+         SourceNursery = as.factor(SourceNursery),
+         STRATA = as.factor(STRATA),
+         GenotypeName_Allyson = as.factor(GenotypeName_Allyson),
+         ColonyNumber = as.factor(ColonyNumber),
+         Experienced_Predation = as.factor(Experienced_Predation),
+         Cumulative_Predation = as.factor(Cumulative_Predation)) %>% 
+  filter(!(STATUS_2 == "dead" & (Snails == "yes" | FishBites == "yes" | PRED_1 > 0))) -> outplant_monitoring_days_survival_glm
+# filtering out the 6 instances where a coral is dead but fish bites, snails, or tissue area due to predation are recorded
+```
+
+
+Add fish abundances over time
+```{r}
+str(fish_survey)
+
+fish_survey %>% 
+  mutate(Region =as.factor(Region), 
+         Site = as.factor(Site)) -> fish_survey
+
+outplant_monitoring_days_survival_glm %>% 
+  right_join(fish_survey %>% dplyr::select(!SURVEY_MONTH), by = c("MI_CORRECTED", "Region", "Region_name", "Site", "Date")) -> outplant_monitoring_days_survival_glm_fish
+```
+
+
+### glmm for prevalence
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(Region != 1) %>% 
+  filter(Days_MI < 30) -> no_region_1
+
+parrotfish_predation_glmm <- glmmTMB(Experienced_Predation ~ Parrotfish*Region_name + (1|Days_MI) + (1|Region/Site) + (1|Species), 
+                             data = no_region_1, 
+                             family = binomial)
+summary(parrotfish_predation_glmm)
+
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(Region != 1) %>%
+  filter(Days_MI == 6) -> outplant_monitoring_days_survival_glm_fish_6days
+
+parrotfish_predation_glmm <- glmmTMB(Cumulative_Predation ~ Parrotfish*Region + (1|Region/Site) + (1|Species), 
+                             data = outplant_monitoring_days_survival_glm_fish_6days, 
+                             family = binomial)
+summary(parrotfish_predation_glmm)
+
+butterflyfish_predation_glmm <- glmmTMB(Cumulative_Predation ~ Butterflyfish*Region + Days_MI  + (1|Region/Site) + (1|Species), 
+                             data = outplant_monitoring_days_survival_glm_fish, 
+                             family = binomial)
+summary(butterflyfish_predation_glmm)
+# no significant effect of butterflyfish on new predation (also tried cumulative_predation and no difference)
+
+butterflyfish_predation_glmm <- glmmTMB(Cumulative_Predation ~ Butterflyfish*Region + (1|Region/Site) + (1|Species), 
+                             data = outplant_monitoring_days_survival_glm_fish_30days, 
+                             family = binomial)
+# no significant effect of parrotfish on new predation
+
+summary(butterflyfish_predation_glmm)
+```
+
+
+### glmm for fish bites
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  mutate(FishBites = case_when(FishBites == "yes" ~ 1,
+                               FishBites == "no" ~ 0)) %>% 
+  filter(Region != 1) -> outplant_monitoring_days_survival_glm_fish_binary
+
+parrotfish_predation_glmm <- glmmTMB(FishBites ~ Parrotfish*Region_name + Days_MI + (1|Region/Site) + (1|Species), 
+                             data = outplant_monitoring_days_survival_glm_fish_binary, 
+                             family = binomial)
+summary(parrotfish_predation_glmm)
+```
+
+```{r}
+# Make predictions at ALL actual time points, then average
+new_data_all_times <- expand.grid(
+  Parrotfish = seq(min(outplant_monitoring_days_survival_glm_fish_binary$Parrotfish), 
+                   max(outplant_monitoring_days_survival_glm_fish_binary$Parrotfish), 
+                   length.out = 100),
+  Region_name = unique(outplant_monitoring_days_survival_glm_fish_binary$Region_name),
+  Days_MI = unique(outplant_monitoring_days_survival_glm_fish_binary$Days_MI),  # all 25 time points
+  Species = outplant_monitoring_days_survival_glm_fish_binary$Species[1],
+  Site = outplant_monitoring_days_survival_glm_fish_binary$Site[1],
+  Region = outplant_monitoring_days_survival_glm_fish_binary$Region[1]
+)
+
+new_data_all_times$predicted <- predict(parrotfish_predation_glmm, 
+                                        newdata = new_data_all_times, 
+                                        type = "response",
+                                        re.form = NA)
+
+# Average across time points
+library(dplyr)
+new_data_avg <- new_data_all_times %>%
+  group_by(Parrotfish, Region_name) %>%
+  summarize(predicted = mean(predicted), .groups = 'drop')
+
+p1<- ggplot(new_data_avg, aes(x = Parrotfish, y = predicted, color = Region_name)) +
+  geom_line(linewidth = 1) +
+  labs(x = "Parrotfish", 
+       y = "Average Predicted Probability",
+       color = "Region") +
+  theme_minimal()
+
+
+# OR continuous temporal gradient (better for showing trend over time)
+new_data_continuous <- expand.grid(
+  Parrotfish = seq(min(no_region_1$Parrotfish), 
+                   max(no_region_1$Parrotfish), 
+                   length.out = 100),
+  Region_name = unique(no_region_1$Region_name),
+  Days_MI = seq(min(no_region_1$Days_MI), 
+                max(no_region_1$Days_MI), 
+                length.out = 50),
+  Species = no_region_1$Species[1],
+  Site = no_region_1$Site[1],
+  Region = no_region_1$Region[1]
+)
+
+new_data_continuous$predicted <- predict(parrotfish_predation_glmm, 
+                                         newdata = new_data_continuous, 
+                                         type = "response",
+                                         re.form = NA)
+
+# Heatmap showing predictions across parrotfish and time
+ggplot(new_data_continuous, aes(x = Days_MI, y = Parrotfish, 
+                                fill = predicted)) +
+  geom_tile() +
+  facet_wrap(~ Region_name, ncol=3) +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(x = "Days Since Outplanting", 
+       y = "Parrotfish",
+       fill = "Predicted\nProbability") +
+  theme_minimal()
+```
+
+
+
+
+# average fish bites vs fish abundance
+```{r}
+library(ggpmisc)
+# parrotfish
+p1<-outplant_monitoring_days_survival_glm_fish %>% 
+  group_by(Region_name, Site, MI_CORRECTED, Species, Parrotfish) %>% 
+  summarize(prop_yes = mean(FishBites == "yes")) %>% 
+  ungroup() %>% 
+  group_by(Region_name, Site, MI_CORRECTED) %>%
+  mutate(mean_fish_bites = mean(prop_yes), se_fishbites = std.error(prop_yes)) %>% 
+  dplyr::select(Region_name, Site, MI_CORRECTED, Parrotfish, mean_fish_bites, se_fishbites) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Parrotfish, y=mean_fish_bites)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=F) +
+  facet_wrap(~Region_name, scales = "free") +
+  labs(y="Proportion of Corals with Fish Bites",
+       x="Parrotfish Abundance") +
+  theme(text = element_text(size=12))
+
+outplant_monitoring_days_survival_glm_fish %>% 
+  ggplot(., aes(x=Days_MI, y=Parrotfish)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=F) +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(text = element_text(size=12))
+
+# butterflyfish
+p2<-outplant_monitoring_days_survival_glm_fish %>% 
+  group_by(Region_name, Site, MI_CORRECTED, Species, Butterflyfish) %>% 
+  summarize(prop_yes = mean(FishBites == "yes")) %>% 
+  ungroup() %>% 
+  group_by(Region_name, Site, MI_CORRECTED) %>%
+  mutate(mean_fish_bites = mean(prop_yes), se_fishbites = std.error(prop_yes)) %>% 
+  dplyr::select(Region_name, Site, MI_CORRECTED, Butterflyfish, mean_fish_bites, se_fishbites) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Butterflyfish, y=mean_fish_bites)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=F) +
+  # stat_poly_eq(aes(label = paste(after_stat(eq.label), 
+  #                                  after_stat(rr.label), 
+  #                                  sep = "~~~")),
+  #              parse = TRUE) + 
+  facet_wrap(~Region_name, scales = "free") +
+  labs(y="Proportion of Corals with Fish Bites",
+       x="Butterflyfish Abundance") +
+  theme(text = element_text(size=12))
+
+plot_grid(p1, p2, ncol=1, labels = c("A", "B"))
+ggsave("plots/Fish_Bites_vs_Fish_Abundance.png", width = 10, height = 10)
+```
+
+
+
+
+## correlation plots 
+
+All time points, parrotfish abundance vs predation prevalence
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  mutate(Experienced_Predation = as.numeric(as.character(Experienced_Predation))) %>% 
+ggplot(., aes(x=Parrotfish, y=Experienced_Predation, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE, method.args=list(family=binomial())) +
+  labs(
+       x = "Parrotfish Abundance",
+       y = "New Predation Prevalence") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(legend.text = element_text(face = "italic"))
+#ggsave("plots/Predation_Prevalence_vs_Parrotfish_Abundance_All_Time_Points.png", width = 8, height = 5)
+```
+
+All time points, butterflyfish abundance vs predation prevalence
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  mutate(Experienced_Predation = as.numeric(as.character(Experienced_Predation))) %>% 
+ggplot(., aes(x=Butterflyfish, y=Experienced_Predation, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE, method.args=list(family=binomial())) +
+  labs(
+       x = "Butterflyfish Abundance",
+       y = "New Predation Prevalence") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(legend.text = element_text(face = "italic"))
+ggsave("plots/Predation_Prevalence_vs_Butterflyfish_Abundance_All_Time_Points.png", width = 8, height = 5)
+```
+
+
+First survey time point, parrotfish abundance vs % tissue area affected (all sites combined)
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(MI_CORRECTED == 1) %>% 
+  mutate(PRED_1 = PRED_1*100) %>% 
+ggplot(., aes(x=Parrotfish, y=PRED_1, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE) +
+  labs(title = "Parrotfish Abundance vs. % Tissue Area Lost to Predation",
+       x = "Parrotfish Abundance",
+       y = "% Tissue") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(legend.text = element_text(face = "italic"))
+```
+First survey time point, butterflyfish abundance vs % tissue area affected (all sites combined)
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(MI_CORRECTED == 1) %>% 
+  mutate(PRED_1 = PRED_1*100) %>% 
+ggplot(., aes(x=Butterflyfish, y=PRED_1, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE) +
+  labs(title = "Butterflyfish Abundance vs. % Tissue Area Lost to Predation",
+       x = "Butterflyfish Abundance",
+       y = "% Tissue") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") 
+```
+
+First survey time point, parrotfish abundance vs predation prevalence (all sites combined)
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(MI_CORRECTED == 1) %>% 
+ggplot(., aes(x=Parrotfish, y=Experienced_Predation, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE) +
+  labs(
+       x = "Parrotfish Abundance",
+       y = "Predation Prevalence") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(legend.text = element_text(face = "italic"), text = element_text(size=12))
+#ggsave("plots/Predation_Prevalence_vs_Parrotfish_Abundance_First_Survey.png", width = 9, height = 5)
+```
+
+First survey time point, butteflyfish abundance vs predation prevalence (all sites combined)
+```{r}
+outplant_monitoring_days_survival_glm_fish %>% 
+  filter(MI_CORRECTED == 1) %>% 
+ggplot(., aes(x=Butterflyfish, y=Experienced_Predation, color = Species)) +
+  geom_point() +
+  geom_smooth(method = "glm", se=FALSE) +
+  labs(
+       x = "Butterflyfish Abundance",
+       y = "Predation Prevalence") +
+  theme_bw() +
+  facet_wrap(~Region_name, scales = "free") +
+  theme(legend.text = element_text(face = "italic"), text = element_text(size=12))
+#ggsave("plots/Predation_Prevalence_vs_Butterflyfish_Abundance_First_Survey.png", width = 9, height = 5)
+```
+
+

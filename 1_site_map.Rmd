@@ -1,0 +1,172 @@
+---
+title: "Site map"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## load liraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(sf)
+library(mapview)
+library(cowplot)
+library(ggpubr)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+# Set plot aesthetics
+theme_set(theme_classic())
+theme_update(text = element_text(size=14, family = "Helvetica", color = "black"),
+             axis.text = element_text(size=12, family = "Helvetica", color = "black"))
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# are the depths the same across time points 
+site_characteristics %>% 
+  group_by(Region, Site, STRATA) %>% 
+  summarise(mean_depth = mean(DEPTH),
+            sd_depth = sd(DEPTH),
+            n = n())
+
+```
+
+## Map of survey sites
+
+```{r FL shapefile, include = FALSE, warning=FALSE, message=FALSE}
+## Load shapefile for detailed Florida shoreline
+FLKs1=st_read('Florida_Shoreline_(1_to_12%2C000_Scale)/Florida_Shoreline_(1_to_12%2C000_Scale).shp')
+
+FLKs1= st_transform(FLKs1, st_crs(4326))
+```
+
+
+```{r outplant site coordinates, include = FALSE, warning=FALSE, message=FALSE}
+outplant_coordinates <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "Site Coordinates")
+outplant_coordinates %>% 
+  mutate(Region_MonitoringOrg = paste0(Region, " - ", MonitoringOrganization)) %>% 
+  mutate(Region_MonitoringOrg = as.factor(Region_MonitoringOrg)) -> outplant_coordinates
+coords_outplant <- st_as_sf(outplant_coordinates, coords = c("OutplantSiteLongitude", "OutplantSiteLatitude"), crs = 4326)
+
+mapview(coords_outplant)
+```
+
+
+```{r outplant site map, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7, fig.cap="Map of coral outplant sites monitored for fish predation in the Reef Tract from May 2021 to May 2023. Numbers on graph indicate site number within each region. Four sites were assigned per region, and there were six regions. Colors indicate the monitoring organization responsible for surveys at each site."}
+ggplot(coords_outplant) +
+  geom_sf(data=FLKs1,fill = "darkgray")+ #shoreline shapefile 
+  geom_point(data=outplant_coordinates,aes(x=OutplantSiteLongitude,y=OutplantSiteLatitude,fill= Region_MonitoringOrg), 
+  shape = 21,colour = "black")+
+  ggrepel::geom_text_repel(data=outplant_coordinates,
+                           aes(label=Site,x=OutplantSiteLongitude,y=OutplantSiteLatitude), 
+                           min.segment.length = 0,
+                           force_pull   = 0, # do not pull toward data points
+    nudge_x      = 0.1,
+    hjust        = 0,
+    segment.size = 0.2,
+    size = 3.5) +
+  ylab('Latitude')+
+  xlab('Longitude')+
+  coord_sf(xlim = c(-79.6, -82), ylim = c(24.4, 27.5)) +
+  theme_bw() +
+  labs(fill = "Region - Monitoring Organization")
+#ggsave("map_of_regions_sites.pdf", width = 7, height = 10)
+```
+
+plot region 3 inshore vs offshore
+```{r}
+coords_outplant %>% 
+  filter(Region == 3) -> region_3
+
+outplant_coordinates %>% 
+   filter(Region == 3) -> region_3_alldata
+
+ggplot(region_3) +
+  geom_sf(data=FLKs1,fill = "darkgray")+ #shoreline shapefile 
+  geom_point(data=region_3_alldata,aes(x=OutplantSiteLongitude,y=OutplantSiteLatitude,fill= Strata), 
+  shape = 21,colour = "black")+
+  ggrepel::geom_text_repel(data=region_3_alldata,
+                           aes(label=SiteName,x=OutplantSiteLongitude,y=OutplantSiteLatitude), 
+                           min.segment.length = 0,
+                           force_pull   = 0, # do not pull toward data points
+    nudge_x      = 0.1,
+    hjust        = 0,
+    segment.size = 0.2,
+    size = 3.5) +
+  ylab('Latitude')+
+  xlab('Longitude')+
+  coord_sf(xlim = c(-80, -80.4), ylim = c(25.25, 25.75)) +
+  theme_bw() +
+  labs(fill = "Reef Strata")
+```
+
+
+
+plot region 5 inshore vs offshore
+```{r}
+coords_outplant %>% 
+  filter(Region == 5) -> region_5
+
+outplant_coordinates %>% 
+   filter(Region == 5) -> region_5_alldata
+
+ggplot(region_5) +
+  geom_sf(data=FLKs1,fill = "darkgray")+ #shoreline shapefile 
+  geom_point(data=region_5_alldata,aes(x=OutplantSiteLongitude,y=OutplantSiteLatitude,fill= Strata), 
+  shape = 21,colour = "black")+
+  ggrepel::geom_text_repel(data=region_5_alldata,
+                           aes(label=SiteName,x=OutplantSiteLongitude,y=OutplantSiteLatitude), 
+                           min.segment.length = 0,
+                           force_pull   = 0, # do not pull toward data points
+    nudge_x      = 0.1,
+    hjust        = 0,
+    segment.size = 0.2,
+    size = 3.5) +
+  ylab('Latitude')+
+  xlab('Longitude')+
+  coord_sf(xlim = c(-80.8, -81.15), ylim = c(24.5, 24.9)) +
+  theme_bw() +
+  labs(fill = "Reef Strata") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

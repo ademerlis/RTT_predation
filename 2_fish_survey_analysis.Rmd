@@ -1,0 +1,629 @@
+---
+title: "RTT Predation Study - Fish Analysis"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This analysis was conducted using:  
+R version 4.5.1 (2025-06-13) -- "Great Square Root"
+
+The RTT (Restoration Team Trials) project was led by FWC and Mote Marine Laboratory. The main goal of this project was to evaluate SCTLD transmission risk associated with coral outplanting in the Florida Reef Tract. As part of this project, fish predation on outplanted corals was monitored at 24 sites across six regions from May 2021 to May 2023. This analysis explores fish abundance trends over time and across regions.
+
+# load liraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(cowplot)
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+# Set plot aesthetics
+theme_set(theme_classic())
+theme_update(text = element_text(size=14, family = "Helvetica", color = "black"),
+             axis.text = element_text(size=12, family = "Helvetica", color = "black"))
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() -> site_characteristics
+
+fish_survey %>% 
+  left_join(., site_characteristics, by = c("Region", "Site", "MI_CORRECTED")) %>% 
+  mutate(unique_site_code = paste0(Region, "_", Site)) -> fish_survey
+```
+
+
+#### mean counts over time
+
+```{r Time series of mean counts of Parrotfish and Butterflyfish during coral outplant surveys by region and survey period, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7, fig.cap="Mean and standard error of Parrotfish and Butterflyfish counts observed during coral outplant monitoring surveys in the Reef Tract from May 2021 to May 2023."}
+
+#by each survey date
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  mutate(MI_CORRECTED = as.numeric(MI_CORRECTED)) %>% 
+  group_by(Date, Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Date, y = mean_count, color = Fish)) +
+  geom_point(position = position_dodge(width = 10)) +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.2, position = position_dodge(width = 10)) +
+  facet_wrap(~Region_name, ncol = 1) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_bw() +
+    scale_x_date(
+    date_breaks = "2 month",
+    date_labels = "%b %Y",
+  ) +
+  labs(x="Date", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+#ggsave("plots/mean_se_count_fish_allsites_bysurveydate.pdf", width = 10, height = 7)
+```
+
+```{r}
+#by monitoring interval
+
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(MI_CORRECTED, Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=MI_CORRECTED, y = mean_count, color = Fish)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.2) +
+  facet_wrap(~Region_name, ncol = 1) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_classic() +
+  labs(x="Monitoring Interval", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+#ggsave("plots/mean_se_count_fish_allsites_bymonitoringinterval.pdf", width = 10, height = 7)
+```
+
+```{r}
+# by survey month
+
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(SURVEY_MONTH, Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=SURVEY_MONTH, y = mean_count, color = Fish)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.2) +
+  facet_wrap(~Region_name, ncol = 1) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_bw() +
+  labs(x="Survey Month", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+   scale_x_date(
+    date_breaks = "2 month",
+    date_labels = "%b %Y",
+  )
+#ggsave("plots/mean_se_count_fish_allsites_bysurveymonth.pdf", width = 10, height = 7)
+```
+
+
+### GLMM - Region
+
+```{r, include = FALSE, warning=FALSE, message=FALSE}
+fish_survey$Region <- as.factor(fish_survey$Region)
+hist(fish_survey$Parrotfish)
+hist(fish_survey$Butterflyfish)
+#data left skewed for both - poisson GLM is most appropriate for that 
+```
+
+Test whether regions differ temporally in parrotfish counts
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+
+# region x time
+glm_parrotfish <- glmmTMB(Parrotfish ~ Region*MI_CORRECTED + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_parrotfish) # AIC = 3157.7
+
+# region x strata x time
+glm_parrotfish <- glmmTMB(Parrotfish ~ Region*STRATA*MI_CORRECTED + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_parrotfish) # AIC = 3155.8
+
+# region x strata + time
+glm_parrotfish <- glmmTMB(Parrotfish ~ Region*STRATA + MI_CORRECTED + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_parrotfish) # AIC = 3146.6
+#capture.output(summary(glm_parrotfish), file = "glm_parrotfish_summary.txt")
+
+# best model includes strata
+
+# residual diagnostics (DHARMA)
+sim_res <- simulateResiduals(glm_parrotfish)
+plot(sim_res)
+
+glm_parrotfish_anova<-Anova(glm_parrotfish, type = "II") # region, strata, and interaction are significant
+# as.data.frame(glm_parrotfish_anova) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("parrotfish_anova_results.csv")
+
+emm <- emmeans(glm_parrotfish, ~ Region, type = "response")
+pairs(emm)  # Pairwise comparisons between regions
+#write_csv(as.data.frame(pairs(emm)), "emm_parrotfish_region_pairwise.csv")
+
+emm <- emmeans(glm_parrotfish, ~ Region*STRATA, type = "response")
+pairs(emm)  # Pairwise comparisons between regions*strata
+
+emm_parrotfish_pairwise <- as.data.frame(pairs(emm))
+
+#write_csv(emm_parrotfish_pairwise, "emm_parrotfish_pairwise.csv")
+```
+
+(archive) testing outliers
+```{r}
+testOutliers(sim_res)
+
+# visualizing outliers - applying the zero-inflation by region helped reduce the number of outliers (likely was significant because region 1 has so few observations)
+outliers <- which(sim_res$scaledResiduals > 0.975 | sim_res$scaledResiduals < 0.025)
+
+# Look at the outlier data
+fish_survey$outlier <- FALSE
+fish_survey$outlier[outliers] <- TRUE
+
+# Check patterns:
+# Are outliers clustered by region?
+table(fish_survey$Region_name[outliers])
+
+# Visualize outliers
+ggplot(fish_survey, aes(x = MI_CORRECTED, y = Parrotfish, color = outlier)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~Region_name) +
+  scale_color_manual(values = c("black", "red"))
+```
+
+
+Test whether regions differ temporally in butterflyfish counts
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# region x time
+glm_butterflyfish <- glmmTMB(Butterflyfish ~ Region*MI_CORRECTED + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_butterflyfish) # AIC = 1537.8
+
+# region x time + strata
+glm_butterflyfish <- glmmTMB(Butterflyfish ~ Region*MI_CORRECTED + STRATA + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_butterflyfish) # AIC = 1528.7
+
+# region + time + strata
+glm_butterflyfish <- glmmTMB(Butterflyfish ~ Region + MI_CORRECTED + STRATA + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_butterflyfish) # AIC = 1527.1
+
+# region x strata + time
+glm_butterflyfish <- glmmTMB(Butterflyfish ~ Region*STRATA + MI_CORRECTED + (1|unique_site_code), 
+                          family=nbinom2, 
+                          ziformula = ~ Region,  # Zero-inflation varies by region,
+                          data = fish_survey) 
+summary(glm_butterflyfish) # AIC = 1524.5
+#capture.output(summary(glm_butterflyfish), file = "glm_butterflyfish_summary.txt")
+
+# residual diagnostics (DHARMA)
+sim_res <- simulateResiduals(glm_butterflyfish)
+plot(sim_res)
+
+glm_butterflyfish_anova <- Anova(glm_butterflyfish, type = "II") # region, strata, time, region:strata all significant
+# as.data.frame(glm_butterflyfish_anova) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("butterflyfish_anova_results.csv")
+
+emm <- emmeans(glm_butterflyfish, ~ Region*STRATA, type = "response")
+pairs(emm)  # Pairwise comparisons between regions*strata
+
+emm <- emmeans(glm_butterflyfish, ~ Region, type = "response")
+pairs(emm)  # Pairwise comparisons between regions*strata
+
+#write_csv(as.data.frame(pairs(emm)), "emm_butterflyfish_region_pairwise.csv")
+
+emm_butterflyfish_pairwise <- as.data.frame(pairs(emm))
+
+#write_csv(emm_butterflyfish_pairwise, "emm_butterflyfish_pairwise.csv")
+```
+
+### Mean counts of fish observed across all time points and sites in each region
+
+```{r}
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  group_by(Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), sd_count = sd(Count), se_count = std.error(Count)) %>% 
+  dplyr::select(Region, Fish, mean_count, se_count) %>% 
+  distinct() 
+```
+
+
+```{r Mean counts across time points and sites, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7, fig.cap="Mean and standard error of Parrotfish and Butterflyfish counts observed using all survey time points."}
+p1<-fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  group_by(Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Region_name, y = mean_count, color = Fish)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.1) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  labs(x="Region", y = "Mean (SE) Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 30, unit = "pt"))
+#ggsave("plots/mean_se_count_fish_allsites_alltimepoints.pdf", width = 7, height = 5)
+```
+
+```{r}
+# just first 30 days
+fish_survey %>% 
+  filter(MI_CORRECTED == "1" | MI_CORRECTED == "2" | MI_CORRECTED == "3") %>%
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  group_by(Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Region_name, y = mean_count, color = Fish)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.2) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_bw() +
+  labs(x="Region", y = "Mean (SE) Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+#ggsave("plots/mean_se_count_fish_allsites_alltimepoints.pdf", width = 7, height = 5)
+```
+
+```{r}
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  group_by(Region_name, Fish) %>% 
+  mutate(mean_count = mean(Count), sd_count = sd(Count)) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Region_name, y = mean_count, color = Fish)) +
+  geom_point(position = position_dodge(width = 0.2)) +
+  geom_errorbar(aes(ymin = mean_count-sd_count, ymax = mean_count+sd_count), width = 0.2,position = position_dodge(width = 0.2)) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  labs(x="Region", y = "Mean (SD) Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+#ggsave("plots/mean_sd_count_fish_allsites_alltimepoints.pdf", width = 7, height = 5)
+```
+
+
+```{r}
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) -> fish_survey_long
+
+kruskal.test(Count ~ Region, data = filter(fish_survey_long, Fish == "Parrotfish")) # p-value < 2.2e-16
+
+dt_parrotfish <- dunn.test::dunn.test(fish_survey_long$Count[fish_survey_long$Fish == "Parrotfish"], 
+                     fish_survey_long$Region[fish_survey_long$Fish == "Parrotfish"], 
+                     method = "holm", kw = TRUE, altp = TRUE)
+
+# Extract into a data.frame
+results_dt_parrotfish <- data.frame(
+  comparison = dt_parrotfish$comparisons,
+  Z = round(dt_parrotfish$Z, 3),
+  p_unadj = signif(dt_parrotfish$altP, 3),
+  p_adj = signif(dt_parrotfish$altP.adjusted, 3)
+)
+
+kruskal.test(Count ~ Region, data = filter(fish_survey_long, Fish == "Butterflyfish")) # p-value <2.2e-16
+
+dt_butterflyfish <- dunn.test::dunn.test(fish_survey_long$Count[fish_survey_long$Fish == "Butterflyfish"],
+                     fish_survey_long$Region[fish_survey_long$Fish == "Butterflyfish"], 
+                     method = "holm", kw = TRUE, altp = TRUE)
+
+# Extract into a data.frame
+results_dt_butterflyfish <- data.frame(
+  comparison = dt_butterflyfish$comparisons,
+  Z = round(dt_butterflyfish$Z, 3),
+  p_unadj = signif(dt_butterflyfish$altP, 3),
+  p_adj = signif(dt_butterflyfish$altP.adjusted, 3)
+)
+
+#write_csv(results_dt_parrotfish, "results_parrotfish_dunn_posthoc.csv")
+#write_csv(results_dt_butterflyfish, "results_butterflyfish_dunn_posthoc.csv")
+```
+
+
+```{r kruskal wallis test to test differences in mean counts between regions and fish species, include=FALSE, warning=FALSE, message=FALSE}
+fish_survey_long %>% 
+  mutate(group = paste0(Region, "-", Fish)) -> fish_survey_long
+
+kruskal.test(Count ~ group, data = fish_survey_long) #p-value < 2.2e-16
+
+dt_group <- dunn.test::dunn.test(fish_survey_long$Count, 
+                     fish_survey_long$group, 
+                     method = "holm", kw = TRUE, altp = TRUE)
+
+# Extract into a data.frame
+results_dt_group <- data.frame(
+  comparison = dt_group$comparisons,
+  Z = round(dt_group$Z, 3),
+  p_unadj = signif(dt_group$altP, 3),
+  p_adj = signif(dt_group$altP.adjusted, 3)
+)
+
+#write_csv(results_dt_group, "results_fishspecies_region_dunn_posthoc.csv")
+```
+
+
+#### Inshore versus offshore comparison of fish counts
+
+```{r Time series of mean counts of fish - inshore vs offshore, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=7, fig.cap="Mean and standard error of Parrotfish and Butterflyfish counts observed during coral outplant monitoring surveys in the Reef Tract from May 2021 to May 2023, separated by inshore and offshore sites."}
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(Region, SURVEY_MONTH, Region_name, Fish, STRATA) %>% 
+  mutate(mean_count = mean(Count), se_count = std.error(Count)) %>% 
+  distinct() %>%
+  ggplot(., aes(x=SURVEY_MONTH, y = mean_count, color = Fish)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_count-se_count, ymax = mean_count+se_count), width = 0.2) +
+  facet_wrap(~Region_name*STRATA, ncol = 2) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_classic() +
+    scale_x_date(
+    date_breaks = "4 month",
+    date_labels = "%b %Y",
+  ) +
+  labs(x="Date", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        text = element_text(size=12))
+#ggsave("plots/inshore_vs_offshore_fishtrends_alltimepoints.pdf", width = 8, height = 9)
+```
+
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE, fig.width=10, fig.height=5, fig.cap="Mean and standard error of Parrotfish and Butterflyfish counts observed using all survey time points, separated by inshore and offshore sites."}
+p2<-fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(Region_name, STRATA, Fish) %>% 
+  summarise(max_fish = max(Count), mean_fish = mean(Count), se_fish = std.error(Count), median_fish = median(Count)) %>% 
+  ggplot(., aes(x=STRATA, y = mean_fish, color = Fish)) +
+  geom_point() +
+  facet_wrap(~Region_name) +
+  geom_errorbar(aes(ymin = mean_fish-se_fish, ymax = mean_fish+se_fish), width = 0.1) +
+  scale_color_manual(values = c("magenta", "blue")) +
+  labs(x="Strata", y = "Mean (SE) Count") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 30, unit = "pt"))
+#ggsave("plots/mean_se_count_fish_inshore_vs_offshore_overall.pdf", width = 10, height = 5)
+```
+
+```{r kruskal wallis test for inshore vs offshore, include=FALSE, warning=FALSE, message=FALSE}
+fish_survey %>% 
+  left_join(., site_characteristics, by = c("Region", "Site", "MI_CORRECTED")) %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  distinct() %>% 
+  mutate(group = paste0(Region, "-", STRATA)) -> fish_counts_long_strata
+
+kruskal.test(Count ~ group, data = filter(fish_counts_long_strata, Fish == "Parrotfish")) # p-value < 2.2e-16
+
+dt_parrotfish <- dunn.test::dunn.test(fish_counts_long_strata$Count[fish_counts_long_strata$Fish == "Parrotfish"], 
+                     fish_counts_long_strata$group[fish_counts_long_strata$Fish == "Parrotfish"], 
+                     method = "holm", kw = TRUE, altp = TRUE)
+
+# Extract into a data.frame
+results_dt_parrotfish <- data.frame(
+  comparison = dt_parrotfish$comparisons,
+  Z = round(dt_parrotfish$Z, 3),
+  p_unadj = signif(dt_parrotfish$altP, 3),
+  p_adj = signif(dt_parrotfish$altP.adjusted, 3)
+)
+
+kruskal.test(Count ~ group, data = filter(fish_counts_long_strata, Fish == "Butterflyfish")) #p-value < 2.2e-16
+
+dt_butterflyfish <- dunn.test::dunn.test(fish_counts_long_strata$Count[fish_counts_long_strata$Fish == "Butterflyfish"],
+                     fish_counts_long_strata$group[fish_counts_long_strata$Fish == "Butterflyfish"], 
+                     method = "holm", kw = TRUE, altp = TRUE)
+
+# Extract into a data.frame
+results_dt_butterflyfish <- data.frame(
+  comparison = dt_butterflyfish$comparisons,
+  Z = round(dt_butterflyfish$Z, 3),
+  p_unadj = signif(dt_butterflyfish$altP, 3),
+  p_adj = signif(dt_butterflyfish$altP.adjusted, 3)
+)
+
+# write_csv(results_dt_parrotfish, "results_parrotfish_dunn_posthoc_strata.csv")
+# write_csv(results_dt_butterflyfish, "results_butterflyfish_dunn_posthoc_strata.csv")
+```
+
+
+```{r}
+# any seasonal trends in parrotfish or butterflyfish abundance?
+
+fish_survey %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  mutate(Month = month(SURVEY_MONTH, label = TRUE)) %>% 
+  group_by(Month, Fish, Region) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=Month, y = Count, color = Fish)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("magenta", "blue")) +
+  theme_bw() +
+  facet_wrap(~Region) +
+  labs(x="Month", y = "Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# no clear trends in time of year
+```
+
+
+
+# combining plots for manuscript
+```{r}
+combined_figure <- plot_grid(p1 + theme(legend.position="none"),
+                                 p2 + theme(legend.position="none"),
+                                 labels = c("A", "B"),
+                                 ncol = 1,
+                                 align = 'v')
+```
+
+
+# Coral Cover from DRM surveys
+```{r}
+DRM_coral <- read_xlsx("csv_files/DRM_Surveys/RT_DRM_Colonies_UM.xlsx")
+
+DRM_coral %>% 
+  dplyr::select(Region, Site, Transect, Species:Heightcm) -> DRM_coral_tidy
+
+DRM_coral %>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach County",
+                                 Region == 2 ~ "Broward County",
+                                 Region == 3 ~ "Miami-Dade County",
+                                 Region == 4 ~ "Monroe County (Upper Keys)",
+                                 Region == 5 ~ "Monroe County (Middle Keys)",
+                                 Region == 6 ~ "Monroe County (Lower Keys)")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> DRM_coral
+
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+DRM_coral %>% 
+  mutate(Region = as.factor(Region)) %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> DRM_coral
+```
+
+
+```{r}
+strata_plot_2<-DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site, STRATA) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  group_by(Region_name, STRATA) %>% 
+  summarise(mean_percent_cover = mean(percent_cover),
+            se_percent_cover = sd(percent_cover)/sqrt(n())) %>%
+  ggplot(., aes(x=STRATA, y=mean_percent_cover, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_percent_cover - se_percent_cover, ymax=mean_percent_cover + se_percent_cover), width=0.2) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(y="Coral cover (%)",
+       x = "Region") +
+  facet_wrap(~Region_name, scales = "free") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 30, unit = "pt"))
+```
+
+```{r}
+combined_figure <- plot_grid(p1 + theme(legend.position="none"),
+                                 p2 + theme(legend.position="none"),
+                                 strata_plot_2 + theme(legend.position="none"),
+                                 labels = c("A", "B", "C"),
+                                 ncol = 1,
+                                 align = 'v')
+ggsave("plots/combined_fish_coralcover_figure.pdf", combined_figure, width = 8, height = 15)
+```
+
+
+
+
+first fish survey
+```{r}
+fish_survey %>% 
+  filter(MI_CORRECTED == 1) -> fish_survey_MI1
+
+DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site, STRATA) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  left_join(., fish_survey_MI1, 
+            by = c("Region_name", "Site", "STRATA")) %>% 
+  ggplot(., aes(x=Butterflyfish, y=percent_cover)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE) 
+```
+
+avg fish abundances
+```{r}
+DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site, STRATA) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  left_join(., fish_survey %>% 
+              group_by(Region_name, Site, STRATA) %>% 
+              summarize(avg_parrotfish = mean(Parrotfish),
+                        avg_butterflyfish = mean(Butterflyfish)),
+            by = c("Region_name", "Site", "STRATA")) %>%
+  pivot_longer(cols = c("avg_parrotfish", "avg_butterflyfish"), names_to = "Fish", values_to = "avg_count") %>%
+  ggplot(., aes(x=avg_count, y=percent_cover, color = Fish)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~Fish+STRATA, scales = "free")
+```
+
+
+
+

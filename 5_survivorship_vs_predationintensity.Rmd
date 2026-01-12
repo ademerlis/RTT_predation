@@ -1,0 +1,283 @@
+---
+title: "5_survivorship_vs_predation"
+author: "Allyson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# load liraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(cowplot)
+library(ggpubr)
+library(glmmTMB)
+library(car)
+library(emmeans)
+library(DHARMa)
+library(performance)
+library(broom.mixed)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+# Set plot aesthetics
+theme_set(theme_classic())
+theme_update(text = element_text(size=14, family = "Helvetica", color = "black"),
+             axis.text = element_text(size=12, family = "Helvetica", color = "black"))
+
+species_colors <- c(
+  "M. cavernosa" = "#CC5500",  # Burnt orange
+  "P. clivosa" = "#E1AD01",  # Mustard yellow
+  "O. faveolata" = "#5A8754"   # Forest green
+)
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+# relevel regions so they go from north to south
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# Tidying dates for survey time points
+
+# Definitions:
+# SURVEY_MONTH which just means the month the monitoring was done (not accurate dates)
+# Date = exact survey date from fish survey data
+# Middle_MI_date = middle date for each MI across all regions
+
+# all corals were outplanted on May 4-6 2021. 
+# first monitoring for all regions was May 12 or 13, 2021.
+
+# for subsequent MI dates, to ensure that every survey groups together on the same time point (when looking at proportions of total outplants across regions) - pick the middle date for each MI across all regions.
+
+outplant_monitoring_with_dates %>% 
+  dplyr::select(MI_CORRECTED, Date) %>% 
+  distinct() %>% 
+  arrange(Date) %>% 
+  group_by(MI_CORRECTED) %>% 
+  slice(ceiling(n()/2)) %>% 
+  drop_na() %>% 
+  rename(Middle_MI_date = Date) -> middle_date_by_MI
+
+# there will be two types of days calculated - days based on monitoring interval middle date, and exact number of days based on the survey date (from the fish survey data). For any statistical tests using time, use the exact days. Monitoring interval will be reserved for grouping over time, or for visualizations.
+
+left_join(outplant_monitoring_with_dates, middle_date_by_MI, by = c("MI_CORRECTED")) %>% 
+  # use Date if it exists, otherwise Middle_MI_date
+  mutate(Date_Monitored = coalesce(Date, Middle_MI_date)) %>%
+  mutate(Exact_Days = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06"))) %>% 
+  mutate(Days_MI = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))) -> outplant_monitoring_days_survival
+
+outplant_monitoring_days_survival %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date, Middle_MI_date, Date_Monitored, Exact_Days, Days_MI) %>% 
+  distinct()
+
+# check that this worked
+outplant_monitoring_days_survival %>% 
+  filter(MI_CORRECTED == 21 & Region == 2)
+
+# create a column for “experienced predation” - fish bites was Yes and/or % live tissue area due to predation is > 0. Snails = no
+# Then make a column for cumulative predation - once it experienced predation, it gets a yes and then stays yes.
+# To account for multiple bites, use cumulative predation where it counts the total number of predation events - so experienced predation as “yes” converted to a number by the end of the data set
+
+outplant_monitoring_days_survival %>% 
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>% 
+  group_by(Region, Site, ColonyNumber) %>% 
+  mutate(Experienced_Predation = ifelse((FishBites == "yes" | PRED_1 > 0) & Snails == "no", "1", "0")) %>% 
+  mutate(Cumulative_Predation = ifelse(cumsum(ifelse(Experienced_Predation == "1", 1, 0)) > 0, "yes", "no")) %>% 
+  mutate(Total_Predation_Events = cumsum(ifelse(Experienced_Predation == "1", 1, 0))) %>% 
+  ungroup() %>% 
+  mutate(Species = case_when(Species == "MCAV" ~ "M. cavernosa",
+                             Species == "OFAV" ~ "O. faveolata",
+                             Species == "PCLI" ~ "P. clivosa")) %>% 
+   mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring_days_survival
+
+# note that Survival encodes 1 = alive, 0 = dead (opposite of kaplan-meier/cox proportional)
+outplant_monitoring_days_survival %>%
+  mutate(Survival = case_when(STATUS_2 == "alive" ~ 1,
+                              STATUS_2 %in% c("dead", "dead_m") ~ 0)) %>% # combine dead and dead_m (missing presumed dead)
+  # note that any "missing" corals will now be NA in Survival column
+  mutate(Species = as.factor(Species),
+         MI_CORRECTED = as.numeric(MI_CORRECTED),
+         Region = as.factor(Region),
+         Site = as.factor(Site),
+         SourceNursery = as.factor(SourceNursery),
+         STRATA = as.factor(STRATA),
+         GenotypeName_Allyson = as.factor(GenotypeName_Allyson),
+         ColonyNumber = as.factor(ColonyNumber),
+         Experienced_Predation = as.factor(Experienced_Predation),
+         Cumulative_Predation = as.factor(Cumulative_Predation)) %>% 
+  drop_na(Days_MI) -> outplant_monitoring_days_survival_glm
+```
+
+
+# end of study survivorship vs 30 day predation intensity
+
+Model survivorship versus predation intensity for a given species x strata (since strata was a significant predictor variable for survivorship, but not region)
+
+```{r}
+outplant_monitoring_days_survival_glm %>% 
+  filter(Days_MI == "28") %>% 
+  dplyr::select(Region:SourceNursery, STRATA, ColonyNumber, PRED_1) -> predation_intensity_30days
+
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == "25") %>% 
+  dplyr::select(Region:SourceNursery, STRATA, ColonyNumber, Survival) -> end_of_study_survivorship
+
+full_join(end_of_study_survivorship, predation_intensity_30days, by = c("Region", "Region_name", "Site", "Species", "STRATA", "SourceNursery", "ColonyNumber")) -> surv_vs_predation_30days
+
+# glmm 
+
+species_model <- glmmTMB(
+  Survival ~ PRED_1*Species + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_model) # AIC 1112.3
+
+species_model <- glmmTMB(
+  Survival ~ PRED_1*Species + STRATA + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_model) # AIC 1108.7
+# residual diagnostics (DHARMA)
+sim_res_species_model <- simulateResiduals(species_model)
+plot(sim_res_species_model)
+
+species_strata_model <- glmmTMB(
+  Survival ~ PRED_1 + Species*STRATA + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_strata_model) # AIC 1111.1
+
+species_strata_model_int <- glmmTMB(
+  Survival ~ PRED_1*Species*STRATA + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_strata_model_int) # AIC 1111.5
+
+# Formal test
+anova(species_strata_model, species_strata_model_int) # not significant
+
+species_region_model <- glmmTMB(
+  Survival ~ PRED_1 + Species*Region + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_region_model) # AIC 1124.9
+
+# species x pred_1 + strata model is best
+``` 
+
+
+```{r}
+# Create full prediction grid with all strata
+pred_grid_full <- expand.grid(
+  PRED_1 = seq(min(surv_vs_predation_30days$PRED_1, na.rm = TRUE),
+               max(surv_vs_predation_30days$PRED_1, na.rm = TRUE),
+               length.out = 100),
+  Species = unique(surv_vs_predation_30days$Species),
+  STRATA = unique(surv_vs_predation_30days$STRATA)
+)
+
+# Generate predictions
+pred_grid_full$predicted_prob <- predict(species_model,
+                                         newdata = pred_grid_full,
+                                         type = "response",
+                                         re.form = NA)
+
+# Average across strata (marginal predictions)
+pred_grid <- pred_grid_full %>%
+  group_by(Species, PRED_1) %>%
+  summarise(predicted_prob = mean(predicted_prob), .groups = "drop")
+
+# Plot
+ggplot() +
+  geom_point(data = surv_vs_predation_30days,
+             aes(x = PRED_1, y = Survival, color = Species)) +
+  geom_line(data = pred_grid,
+            aes(x = PRED_1, y = predicted_prob, color = Species),
+            linewidth = 1.5) +
+  labs(x = "Predation Intensity at 30 Days",
+       y = "End of Study Survivorship",
+       color = "Species") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_classic(base_size = 14) +
+  scale_color_manual(values = species_colors) +
+  theme(
+    legend.text = element_text(face = "italic")
+  ) 
+#ggsave("plots/predation_intensity_30days_versus_survival.pdf", width = 8, height = 6)
+```
+
+
+stats
+```{r}
+summary(species_model)
+#capture.output(summary(species_model), file = "glmm_species_model_predation_intensity_vs_survivorship_summary.txt")
+
+glmm_intensity_30_species_anova <- Anova(species_model, type = "II")
+#significant effect of Species, strata, and pred_1 x species
+# as.data.frame(glmm_intensity_30_species_anova) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("species_strata_predation_intensity_anova_results.csv")
+
+glmm_intensity_30_species_pred_pairs <- emmeans(species_model, pairwise ~ Species*PRED_1, adjust = "tukey")
+
+#write.csv(as.data.frame(glmm_intensity_30_species_pred_pairs$contrasts), "emmeans_contrasts_predation_intensity_species_pred.csv", row.names = FALSE)
+
+# Get the effect of PRED_1 for each species
+slopes_by_species <- emtrends(species_model, 
+                              ~ Species, 
+                              var = "PRED_1",
+                              infer = TRUE)  # Add confidence intervals
+print(slopes_by_species)
+
+# Test if slopes differ significantly between species
+slopes_contrasts <- pairs(slopes_by_species)
+print(slopes_contrasts)
+
+```
+
+
+
+
+
+

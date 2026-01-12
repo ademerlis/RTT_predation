@@ -1,0 +1,439 @@
+---
+title: "tidying_original_data"
+author: "Allyson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load libraries
+```{r}
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(cowplot)
+library(car)
+```
+
+# Read in DRM surveys
+```{r}
+DRM_coral <- read_xlsx("csv_files/DRM_Surveys/RT_DRM_Colonies_UM.xlsx")
+DRM_all <- read_xlsx("csv_files/DRM_Surveys/RT_DRM_General_UM.xlsx", sheet = "RT_DRM_Survey_Edited")
+
+DRM_all %>% 
+  dplyr::select(`Region:`:`Date:`, Rugosity_1:Rugosity_10, `Depth:`, `Habitat:`, `Number of corals`) %>% 
+  rename(Region = `Region:`,
+         Site = `Site:`,
+         Date = `Date:`,
+         Depth_m = `Depth:`,
+         Habitat = `Habitat:`,
+         Num_corals = `Number of corals`) %>% 
+  mutate(Transect = as.double(Transect))%>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach County",
+                                 Region == 2 ~ "Broward County",
+                                 Region == 3 ~ "Miami-Dade County",
+                                 Region == 4 ~ "Monroe County (Upper Keys)",
+                                 Region == 5 ~ "Monroe County (Middle Keys)",
+                                 Region == 6 ~ "Monroe County (Lower Keys)")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> DRM_general_tidy
+
+DRM_coral %>% 
+  dplyr::select(Region, Site, Transect, Species:Heightcm) -> DRM_coral_tidy
+
+full_join(DRM_general_tidy, DRM_coral_tidy, by = c("Region", "Site", "Transect")) -> DRM_full_tidy
+
+DRM_coral %>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach County",
+                                 Region == 2 ~ "Broward County",
+                                 Region == 3 ~ "Miami-Dade County",
+                                 Region == 4 ~ "Monroe County (Upper Keys)",
+                                 Region == 5 ~ "Monroe County (Middle Keys)",
+                                 Region == 6 ~ "Monroe County (Lower Keys)")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> DRM_coral
+```
+
+
+read in outplant monitoring data (for inshore/offshore)
+
+```{r}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+```
+
+
+```{r}
+DRM_general_tidy %>% 
+  mutate(Region = as.factor(Region)) %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> DRM_general_tidy
+
+DRM_coral %>% 
+  mutate(Region = as.factor(Region)) %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> DRM_coral
+```
+
+
+# Rugosity
+```{r}
+DRM_general_tidy %>% 
+  pivot_longer(cols = Rugosity_1:Rugosity_10, names_to = "Rugosity_Measurement", values_to = "Rugosity_Value") %>% 
+   mutate(Region = as.factor(Region), Site = as.factor(Site)) %>% 
+  ggplot(., aes(x=Site, y=Rugosity_Value)) +
+  geom_boxplot() +
+  facet_wrap(~Region, scales = "free")
+  
+  
+DRM_general_tidy %>% 
+  pivot_longer(cols = Rugosity_1:Rugosity_10, names_to = "Rugosity_Measurement", values_to = "Rugosity_Value") %>% 
+  group_by(Region, Site, Transect) %>% 
+  mutate(mean_rugosity = mean(Rugosity_Value), 
+                              std_dev_rugosity = sd(Rugosity_Value)) %>% 
+  mutate(Region = as.factor(Region), Site = as.factor(Site)) %>% 
+  ggplot(., aes(x=Site, y=mean_rugosity, color = Habitat)) +
+  geom_point() +
+  facet_wrap(~Region, scales = "free") +
+  theme_bw()
+
+DRM_general_tidy %>% 
+  pivot_longer(cols = Rugosity_1:Rugosity_10, names_to = "Rugosity_Measurement", values_to = "Rugosity_Value") %>% 
+  group_by(Region, Site, Transect) %>% 
+  mutate(mean_rugosity = mean(Rugosity_Value), 
+                              std_dev_rugosity = sd(Rugosity_Value)) %>% 
+  mutate(Region = as.factor(Region), Site = as.factor(Site)) %>% 
+  ggplot(., aes(x=Site, y=Depth_m, color = Habitat)) +
+  geom_point() +
+  facet_wrap(~Region) +
+  theme_bw()
+```
+
+Calculate average depth and rugosity range per site
+```{r}
+DRM_general_tidy %>% 
+  pivot_longer(cols = Rugosity_1:Rugosity_10, names_to = "Rugosity_Measurement", values_to = "Rugosity_Value") %>% 
+  group_by(Region, Site) %>% 
+  mutate(mean_rugosity = mean(Rugosity_Value), 
+                              std_dev_rugosity = sd(Rugosity_Value),
+         avg_depth = mean(Depth_m),
+          rugosity_range = max(Rugosity_Value) - min(Rugosity_Value)) %>% 
+  select(Region, Site, mean_rugosity, std_dev_rugosity, avg_depth, Habitat, rugosity_range) %>% 
+  distinct() #%>% 
+  #write_csv("csv_files/DRM_Surveys/DRM_site_rugosity_depth.csv")
+```
+
+
+
+# Coral density
+```{r}
+# 4, 1 x 10 m transects = 40m^2 reef area
+#Mean ± SE density (number of colonies/m2)
+
+DRM_general_tidy %>% 
+  group_by(Region, STRATA) %>% 
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/80),
+            se_density_per_m2 = sd(Num_corals/80)/sqrt(n())) %>% 
+  ggplot(., aes(x=STRATA, y=mean_density_per_m2)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  facet_wrap(~Region) +
+  theme_bw()
+
+p1<-DRM_general_tidy %>% 
+  group_by(Region_name) %>% # 4 sites per region, 40 m^2 per site
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/160),
+            se_density_per_m2 = sd(Num_corals/160)/sqrt(n())) %>% 
+  ggplot(., aes(x=Region_name, y=mean_density_per_m2, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  theme_bw(base_size = 12) +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Region") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 20, l = 30, unit = "pt"))
+
+strata_plot1<-DRM_general_tidy %>% 
+  group_by(Region_name, STRATA) %>% # 2 sites per strata, 40 m^2 per site
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/80),
+            se_density_per_m2 = sd(Num_corals/80)/sqrt(n())) %>% 
+  ggplot(., aes(x=STRATA, y=mean_density_per_m2, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  theme_bw(base_size = 12) +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Region") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 20, l = 30, unit = "pt")) +
+  facet_wrap(~Region_name, scales = "free")
+```
+
+Separate by coral species
+```{r}
+p3<-DRM_coral %>% 
+  group_by(Region_name, Site, Transect, Species) %>% 
+  summarize(total_corals = n()) %>% 
+  filter(total_corals > 1) %>% 
+  ungroup() %>% 
+  group_by(Region_name, Species) %>% 
+  summarize(mean_density_per_m2 = mean(total_corals/160),
+            se_density_per_m2 = sd(total_corals/160)/sqrt(n())) %>% 
+  slice_max(order_by = mean_density_per_m2, n = 5) %>%
+  ggplot(., aes(x= Species, y=mean_density_per_m2, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  facet_wrap(~Region_name, scales = "free") +
+  theme_bw(base_size = 12) +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+DRM_coral %>% 
+  group_by(Region_name, Site, STRATA, Transect, Species) %>% 
+  summarize(total_corals = n()) %>% 
+  filter(total_corals > 1) %>% 
+  ungroup() %>% 
+  group_by(Region_name, Species, STRATA) %>% 
+  summarize(mean_density_per_m2 = mean(total_corals/80),
+            se_density_per_m2 = sd(total_corals/80)/sqrt(n())) %>%
+  ungroup() %>% 
+  group_by(Region_name, STRATA) %>% 
+  slice_max(order_by = mean_density_per_m2, n = 5) %>%
+  ggplot(., aes(x= Species, y=mean_density_per_m2, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  facet_wrap(~Region_name+STRATA, scales = "free") +
+  theme_bw(base_size = 12) +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+# just MCAV, OFAV, PCLI
+DRM_coral %>% 
+  filter(Species == "MCAV" | Species == "OFAV" | Species == "PCLI") %>%
+  group_by(Region_name, Site, STRATA, Transect, Species) %>% 
+  summarize(total_corals = n()) %>% 
+  filter(total_corals > 1) %>% 
+  ungroup() %>% 
+  group_by(Region_name, Species, STRATA) %>% 
+  summarize(mean_density_per_m2 = mean(total_corals/80),
+            se_density_per_m2 = sd(total_corals/80)/sqrt(n())) %>% 
+  #slice_max(order_by = mean_density_per_m2, n = 5) %>%
+  ggplot(., aes(x= STRATA, y=mean_density_per_m2, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  facet_wrap(~Region_name, scales = "free") +
+  theme_bw(base_size = 12) +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Species") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Coral cover as a percentage of the total area
+
+if the total area is 40 m ^2 per site
+
+take surface area of the coral - area of a circle using diameter, and then multiply by live tissue area % (add up old + recent mortality, then subtract that from area)
+
+area of circle formula = A = 0.25πd^2
+
+```{r}
+p2<-DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  group_by(Region_name) %>% 
+  summarise(mean_percent_cover = mean(percent_cover),
+            se_percent_cover = sd(percent_cover)/sqrt(n())) %>%
+  ggplot(., aes(x=Region_name, y=mean_percent_cover, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_percent_cover - se_percent_cover, ymax=mean_percent_cover + se_percent_cover), width=0.2) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(y="Coral cover (%)",
+       x = "Region") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 30, unit = "pt"))
+
+strata_plot_2<-DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site, STRATA) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  group_by(Region_name, STRATA) %>% 
+  summarise(mean_percent_cover = mean(percent_cover),
+            se_percent_cover = sd(percent_cover)/sqrt(n())) %>%
+  ggplot(., aes(x=STRATA, y=mean_percent_cover, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_percent_cover - se_percent_cover, ymax=mean_percent_cover + se_percent_cover), width=0.2) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(y="Coral cover (%)",
+       x = "Region") + 
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 30, unit = "pt")) +
+  facet_wrap(~Region_name, scales = "free")
+
+```
+
+
+```{r}
+top_row <- plot_grid(p1, p2, ncol = 2, labels = c("A", "B"))
+bottom_row <- plot_grid(p3, ncol = 1, labels = "C")
+
+plot_grid(top_row, bottom_row, 
+          ncol = 1,
+          rel_heights = c(1, 1)) 
+
+ggsave("DRM_coral_density_cover_by_region.png", width = 8, height = 10)
+```
+
+
+```{r}
+plot_grid(strata_plot1, strata_plot_2, 
+          ncol = 1,
+          rel_heights = c(1, 1), 
+          labels = c("A", "B")) 
+ggsave("DRM_coral_density_cover_by_strata_region.png", width = 8, height = 10)
+```
+
+
+# Stats
+
+## regional comparison
+
+coral density
+```{r}
+# calculate individual coral density for each transect (number of corals per 10 meter transect)
+DRM_general_tidy %>% 
+  dplyr::select(Region, Site, Transect, Num_corals:STRATA) %>% 
+  mutate(density_per_m2 = Num_corals/10) -> DRM_density_stats
+
+ggplot(DRM_density_stats, aes(x=Region_name, y = density_per_m2)) +
+  geom_point()
+
+density_glm <- glmmTMB(density_per_m2 ~ Region_name + (1|Region/Site/Transect), data = DRM_density_stats, family = gaussian)
+
+summary(density_glm)
+
+sim_res_density_glm <- simulateResiduals(density_glm)
+plot(sim_res_density_glm)
+
+Anova(density_glm, Type = "II")
+# region is significant
+
+emmeans(density_glm, pairwise ~ Region_name)
+# only (Martin/Palm Beach County) - Monroe County (Middle Keys) is significantly different
+```
+
+coral cover
+```{r}
+# calculate proportion of total transect area covered by coral 
+DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region, Site, Transect) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 10),
+            STRATA = first(STRATA),
+            Region_name = first(Region_name)) -> DRM_cover_stats
+
+coral_cover_glm <- glmmTMB(percent_cover ~ Region_name + (1|Region/Site/Transect),
+                 data = DRM_cover_stats,
+                 family = beta_family())
+
+summary(coral_cover_glm)
+sim_res_coral_cover_glm <- simulateResiduals(coral_cover_glm)
+plot(sim_res_coral_cover_glm)
+
+Anova(coral_cover_glm, Type = "II") # not significant
+```
+
+
+
+
+
+## inshore vs offshore
+
+this wasn't significantly different for all regions - just monroe county
+
+coral density
+```{r}
+# calculate individual coral density for each transect (number of corals per 10 meter transect)
+DRM_general_tidy %>% 
+  dplyr::select(Region, Site, Transect, Num_corals:STRATA) %>% 
+  mutate(density_per_m2 = Num_corals/10) -> DRM_density_stats
+
+ggplot(DRM_density_stats, aes(x=STRATA, y = density_per_m2)) +
+  geom_point() +
+  facet_wrap(~Region_name)
+
+density_glm <- glmmTMB(density_per_m2 ~ Region_name * STRATA + (1|Region/Site/Transect), data = DRM_density_stats, family = gaussian)
+
+summary(density_glm)
+
+sim_res_density_glm <- simulateResiduals(density_glm)
+plot(sim_res_density_glm)
+
+Anova(density_glm, Type = "II")
+# region, strata, and interaction are significant
+
+emmeans(density_glm, pairwise ~ STRATA | Region_name)
+# only monroe county sites are significantly different between inshore and offshore within each region
+
+emmeans(density_glm, pairwise ~ Region_name|STRATA)
+# inshore, Martin/Palm beach significantly lower Martin/Palm beach than all other counties (except Broward and Miami Dade)
+```
+
+coral cover
+```{r}
+# calculate proportion of total transect area covered by coral 
+DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region, Site, Transect) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 10),
+            STRATA = first(STRATA),
+            Region_name = first(Region_name)) -> DRM_cover_stats
+
+coral_cover_glm <- glmmTMB(percent_cover ~ Region_name * STRATA + (1|Region/Site/Transect),
+                 data = DRM_cover_stats,
+                 family = beta_family())
+
+summary(coral_cover_glm)
+sim_res_coral_cover_glm <- simulateResiduals(coral_cover_glm)
+plot(sim_res_coral_cover_glm)
+
+Anova(coral_cover_glm, Type = "II")
+
+emmeans(coral_cover_glm, pairwise ~ STRATA | Region_name)
+# only monroe county sites are significantly different between inshore and offshore within each region
+
+emmeans(coral_cover_glm, pairwise ~ Region_name|STRATA)
+```
+
+
+

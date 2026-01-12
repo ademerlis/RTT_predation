@@ -1,0 +1,206 @@
+---
+title: "6_predation_index"
+author: "Allyson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Assess early predation rate (by day 30) and intensity (max predation observed) for each region, then calculate a predation index as the product of prevalence and intensity. Rank regions by this index.
+
+```{r}
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(cowplot)
+library(ggpubr)
+library(glmmTMB)
+library(DHARMa)
+```
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+# relevel regions so they go from north to south
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# Tidying dates for survey time points
+
+# Definitions:
+# SURVEY_MONTH which just means the month the monitoring was done (not accurate dates)
+# Date = exact survey date from fish survey data
+# Middle_MI_date = middle date for each MI across all regions
+
+# all corals were outplanted on May 4-6 2021. 
+# first monitoring for all regions was May 12 or 13, 2021.
+
+# for subsequent MI dates, to ensure that every survey groups together on the same time point (when looking at proportions of total outplants across regions) - pick the middle date for each MI across all regions.
+
+outplant_monitoring_with_dates %>% 
+  dplyr::select(MI_CORRECTED, Date) %>% 
+  distinct() %>% 
+  arrange(Date) %>% 
+  group_by(MI_CORRECTED) %>% 
+  slice(ceiling(n()/2)) %>% 
+  drop_na() %>% 
+  rename(Middle_MI_date = Date) -> middle_date_by_MI
+
+# there will be two types of days calculated - days based on monitoring interval middle date, and exact number of days based on the survey date (from the fish survey data). For any statistical tests using time, use the exact days. Monitoring interval will be reserved for grouping over time, or for visualizations.
+
+left_join(outplant_monitoring_with_dates, middle_date_by_MI, by = c("MI_CORRECTED")) %>% 
+  # use Date if it exists, otherwise Middle_MI_date
+  mutate(Date_Monitored = coalesce(Date, Middle_MI_date)) %>%
+  mutate(Exact_Days = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06"))) %>% 
+  mutate(Days_MI = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))) -> outplant_monitoring_days_survival
+
+outplant_monitoring_days_survival %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date, Middle_MI_date, Date_Monitored, Exact_Days, Days_MI) %>% 
+  distinct()
+
+# check that this worked
+outplant_monitoring_days_survival %>% 
+  filter(MI_CORRECTED == 21 & Region == 2)
+
+# create a column for “experienced predation” - fish bites was Yes and/or % live tissue area due to predation is > 0. Snails = no
+# Then make a column for cumulative predation - once it experienced predation, it gets a yes and then stays yes.
+# To account for multiple bites, use cumulative predation where it counts the total number of predation events - so experienced predation as “yes” converted to a number by the end of the data set
+
+outplant_monitoring_days_survival %>% 
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>% 
+  group_by(Region, Site, ColonyNumber) %>% 
+  mutate(Experienced_Predation = ifelse((FishBites == "yes" | PRED_1 > 0) & Snails == "no", "1", "0")) %>% 
+  mutate(Cumulative_Predation = ifelse(cumsum(ifelse(Experienced_Predation == "1", 1, 0)) > 0, "1", "0")) %>% 
+  mutate(Total_Predation_Events = cumsum(ifelse(Experienced_Predation == "1", 1, 0))) %>% 
+  ungroup() %>% 
+  mutate(Species = case_when(Species == "MCAV" ~ "M. cavernosa",
+                             Species == "OFAV" ~ "O. faveolata",
+                             Species == "PCLI" ~ "P. clivosa")) %>% 
+   mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring_days_survival
+
+# note that Survival encodes 1 = alive, 0 = dead (opposite of kaplan-meier/cox proportional)
+outplant_monitoring_days_survival %>%
+  mutate(Survival = case_when(STATUS_2 == "alive" ~ 1,
+                              STATUS_2 %in% c("dead", "dead_m") ~ 0)) %>% # combine dead and dead_m (missing presumed dead)
+  # note that any "missing" corals will now be NA in Survival column
+  mutate(Species = as.factor(Species),
+         MI_CORRECTED = as.numeric(MI_CORRECTED),
+         Region = as.factor(Region),
+         Site = as.factor(Site),
+         SourceNursery = as.factor(SourceNursery),
+         STRATA = as.factor(STRATA),
+         GenotypeName_Allyson = as.factor(GenotypeName_Allyson),
+         ColonyNumber = as.factor(ColonyNumber),
+         Experienced_Predation = as.factor(Experienced_Predation),
+         Cumulative_Predation = as.factor(Cumulative_Predation)) %>% 
+  drop_na(Days_MI) -> outplant_monitoring_days_survival_glm
+```
+
+
+```{r}
+regions <- unique(outplant_monitoring_days_survival_glm$Region)
+
+min(outplant_monitoring_days_survival_glm$PRED_1) #0
+max(outplant_monitoring_days_survival_glm$PRED_1) #0.9 
+# scaled 0-1 as a proportion 
+
+# Create empty dataframe to store results
+PredationIndex <- data.frame(
+  Region = character(),
+  Prevalence = numeric(),
+  Intensity = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each region
+for (region in regions) {
+  
+  # Filter to this specific region
+  region_data <- outplant_monitoring_days_survival_glm %>%
+    filter(Region == region)
+  
+  # Calculate Prevalence: average across species (equal weight per species)
+  final_obs <- region_data %>%
+    group_by(Species, ColonyNumber) %>%
+    slice_max(Days_MI, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  species_prev <- final_obs %>%
+    group_by(Species) %>%
+    summarise(
+      Prev = mean(Cumulative_Predation == "1"),
+      N = n()
+    )
+  
+  prevalence <- mean(species_prev$Prev)
+  
+  # Calculate Intensity: average across species (equal weight per species)
+  max_per_coral <- region_data %>%
+    filter(Experienced_Predation == "1") %>%
+    group_by(Species, ColonyNumber) %>%
+    summarise(MaxPred = max(PRED_1, na.rm = TRUE), .groups = "drop")
+  
+  species_intensity <- max_per_coral %>%
+    group_by(Species) %>%
+    summarise(
+      MedianIntensity = median(MaxPred, na.rm = TRUE),
+      N_predated = n()
+    )
+  
+  if(nrow(species_intensity) > 0) {
+    intensity <- mean(species_intensity$MedianIntensity)
+  } else {
+    intensity <- 0
+  }
+  
+  # Add results to dataframe
+  PredationIndex <- rbind(
+    PredationIndex,
+    data.frame(
+      Region = region,
+      Prevalence = prevalence,
+      Intensity = intensity
+    )
+  )
+}
+
+# Calculate index and rank
+PredationIndex <- PredationIndex %>%
+  mutate(
+    Index = Prevalence * Intensity,
+    Rank = rank(-Index)
+  ) %>%
+  arrange(Rank)
+
+print(PredationIndex)
+
+write_csv(PredationIndex, "Predation_Index_by_Region.csv")
+```
+

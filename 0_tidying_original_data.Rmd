@@ -1,0 +1,355 @@
+---
+title: "tidying_original_data"
+author: "Allyson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load libraries
+```{r}
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+```
+
+
+# Read in original data files
+
+```{r Monitoring Intervals and Dates, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("../Original_Data/FromBillSharpe/alldata_FWC/DEP_RT_OUTPLANT_5_24.xlsx", sheet = "RT_OUTPLANT_CORRECTED_4_25")
+
+# Analyzing Monitoring Intervals (MI) 0-25, not including 7.5 or 16.5 (these were additional monitoring time points by BNP team at Region 3, sites 3-4 only)
+
+#fix dates that were read in from Excel wrong
+outplant_monitoring %>% 
+  #mutate(SURVEY_MONTH = as.numeric(SURVEY_MONTH)) %>% it fixed itself somehow
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  filter(MI_CORRECTED != 7.5 & MI_CORRECTED != 16.5) %>% 
+  dplyr::select(MI_CORRECTED, SURVEY_MONTH) %>% 
+  mutate(MI_CORRECTED = as.factor(MI_CORRECTED)) -> monitoring_interval_dates
+
+# outplant data sheet doesn't have exact date of survey, only SURVEY_MONTH
+
+fish_survey <- read_xlsx("../Original_Data/FromBillSharpe/alldata_FWC/DEP_RT_DETAIL_5_24.xlsx", sheet = "RT_Survey_DETAIL_MI0_MI20_FOR D")
+
+fish_survey %>% 
+  dplyr::select(Region, Site, MI_CORRECTED, Date) %>% 
+  mutate(Region = as.factor(Region), Site = as.factor(Site), MI_CORRECTED = as.factor(MI_CORRECTED)) %>% 
+  full_join(., monitoring_interval_dates) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+```
+
+# correcting dates for monitoring intervals for regions and sites
+
+```{r load and tidy fish survey data, include = FALSE, warning=FALSE, message=FALSE}
+fish_survey <- read_xlsx("../Original_Data/FromBillSharpe/alldata_FWC/DEP_RT_DETAIL_5_24.xlsx", sheet = "RT_Survey_DETAIL_MI0_MI20_FOR D")
+
+# filter for columns of interest
+fish_survey %>% 
+  dplyr::select(Region, Site, MI_CORRECTED, Date, `@#Parrotfishgt10cm`, `@#Butterflyfish`) %>% 
+  filter(MI_CORRECTED != 7.5 & MI_CORRECTED != 16.5) %>% 
+  mutate(Region = as.factor(Region), Site = as.factor(Site), MI_CORRECTED = as.factor(MI_CORRECTED)) %>%  
+  mutate(Region_name = case_when(Region == "1" ~ "Martin/Palm Beach County",
+                                 Region == "2" ~ "Broward County",
+                                 Region == "3" ~ "Miami-Dade County",
+                                 Region == "4" ~ "Monroe County (Upper Keys)",
+                                 Region == "5" ~ "Monroe County (Middle Keys)",
+                                 Region == "6" ~ "Monroe County (Lower Keys)")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) %>% 
+  dplyr::rename(Parrotfish = `@#Parrotfishgt10cm`, Butterflyfish = `@#Butterflyfish`) -> fish_survey_tidy
+
+fish_survey_tidy %>% 
+  distinct() #602 rows
+
+full_join(fish_survey_tidy, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Date", "Region", "Site")) %>% 
+  distinct() %>% 
+  drop_na() -> fish_survey_tidy_dates #602 rows
+# MI = 1 and 2 are both in the month of may, so they're getting the same date
+
+#write_csv(fish_survey_tidy_dates, "fish_survey_tidy_dates.csv")
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Date, Region, Site) %>%
+  separate(Date, into = c("Date", "Time"), sep = "T") %>% 
+  mutate(Date = as.Date(Date)) %>% 
+  ggplot(., aes(x=Date, y=MI_CORRECTED, color = Site)) +
+  geom_point() +
+  facet_wrap(~Region)
+  
+# some dates look wrong -- like at the beginning time points for region 6
+```
+
+```{r}
+# region 5 
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Date, Region, Site) %>%
+  separate(Date, into = c("Date", "Time"), sep = "T") %>% 
+  filter(Region == 5) %>% 
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date) 
+# MI_CORRECTED 4 site 1 is on 2021-06-02, when the rest of the sites for MI 4 are 2021-06-28 or 2021-06-30
+
+# region 6 
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Date, Region, Site) %>%
+  separate(Date, into = c("Date", "Time"), sep = "T") %>% 
+  filter(Region == 6) %>% 
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date) 
+
+# a date for MI_CORRECTED 12 is 2021-04-15. All the other 12s occur in 2022-03-09 (sites 2 and 4) or 2022-03-15 (site 1)
+
+# I edited the Supplementary Table 1 and removed the times (irrelevant) and changed the dates that I found above
+```
+
+
+```{r}
+# new error alert: some sites have duplicate date because they were assigned the wrong monitoring interval
+# I'm determining what's "correct" based on the creation date in the DEP_RT_DETAIL_05_24 file
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) %>% 
+  view()
+
+outplant_fish_monitoring_dates %>% 
+   count(MI_CORRECTED, Region, Site) %>%
+  filter(n > 1) # these are all the potential errors - manually checking in the DEP_RT_DETAIL file to see if their creation dates match up (within a month), or if they're way off
+# this could also be why some MIs have "missing" time points for some sites, they were misassigned to the wrong MI
+
+# corrected MI 3 to 4 because of the date
+# for MI 17 region 6, there are duplicates because sometimes two fish surveys were entered by the same group with slightly different start/end times and slightly different numbers. going to delete one row and only keep one survey because it inflates how many fish were actually observed there (i.e. if survey 1 saw 10 parrotfish and survey 2 saw 10 parrotfish, but then you group by site, it looks like 20 parrotfish in total). I deleted two rows - one had the wrong date and had survey times at night, and the other had different start/end times
+
+# I am working under the assumption that for a given region, sites 1 and 2 are monitored on the same date, and sites 3 and 4 are monitored on the same date.(generally)
+
+# for MI 22 - I believe that two of the surveys for region 1 sites 1 and 2 were incorrectly reassigned to MI 22 from MI 21. I think this because there are no surveys for MI 21 for sites 1 and 2 in region 1. so I am changing them back to MI 21.
+
+# for MI 24, it looks like they did the monitoring twice. I'm going to delete the first time point because maybe they had to go back and redo it or something
+```
+
+
+
+```{r Max and mean number of fish observed per region and strata over time period, include = FALSE, warning=FALSE, message=FALSE}
+fish_survey_tidy_dates %>% 
+  left_join(., site_characteristics, by = c("Region", "Site", "MI_CORRECTED")) %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(Region, Fish) %>% 
+  summarise(max_fish = max(Count), mean_fish = mean(Count), se_fish = std.error(Count), median_fish = median(Count)) #%>% 
+  # write_csv("fish_summary_counts.csv")
+
+fish_survey_tidy_dates %>% 
+  left_join(., site_characteristics, by = c("Region", "Site", "MI_CORRECTED")) %>% 
+  pivot_longer(Parrotfish:Butterflyfish, names_to = "Fish", values_to = "Count") %>% 
+  group_by(Region, STRATA, Fish) %>% 
+  summarise(max_fish = max(Count), mean_fish = mean(Count), se_fish = std.error(Count), median_fish = median(Count)) #%>% 
+  #write_csv("fish_summary_strata_counts.csv")
+```
+
+
+### Coral outplant monitoring data
+
+```{r tidy outplant data, include = FALSE, warning=FALSE, message=FALSE}
+# Analyzing Monitoring Intervals (MI) 0-25, not including 7.5 or 16.5 (these were additional monitoring time points by BNP team at Region 3, sites 3-4 only)
+
+#fix dates that were read in from Excel wrong
+outplant_monitoring %>% 
+  #mutate(SURVEY_MONTH = as.numeric(SURVEY_MONTH)) %>% 
+  mutate(SURVEY_MONTH = as.Date(SURVEY_MONTH)) %>% 
+  filter(MI_CORRECTED != 7.5 & MI_CORRECTED != 16.5) %>% 
+  dplyr::select(MI_CORRECTED:Species, Snails:Bleach, Notes, DEPTH:SURVEY_MONTH) %>% 
+  mutate(Region_name = case_when(Region == "1" ~ "Martin/Palm Beach County",
+                                 Region == "2" ~ "Broward County",
+                                 Region == "3" ~ "Miami-Dade County",
+                                 Region == "4" ~ "Monroe County (Upper Keys)",
+                                 Region == "5" ~ "Monroe County (Middle Keys)",
+                                 Region == "6" ~ "Monroe County (Lower Keys)")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) %>% 
+#remove PCLI genotypes that were later determined to be PSTR: UM PCLI 1, MML PCLI 1
+  filter(!(Species == "PCLI" & Genotype == "1" & (ColonySource == "UM" | ColonySource == "MML")))  -> outplant_monitoring_filtered
+#filtered out unnecessary columns and uncorrected columns 
+
+# Clean up the empty fields, "missing" values, add source type
+
+outplant_monitoring_filtered %>% 
+    mutate(Snails = ifelse(is.na(Snails), "no", Snails),
+           FishBites = ifelse(is.na(FishBites), "no", FishBites),
+           Bleach = ifelse(is.na(Bleach), "N", Bleach)) -> outplant_monitoring_filtered_tidy
+```
+
+### adding in genotype information from Sydney Bell's analysis
+```{r}
+# add in new genotype information based on Sydney Bell's anaylsis (which identified clones), and removing the "T" and "S" from Mote genotypes 
+#read in tidied genotype data
+coraloutplantmetadata <- readxl::read_xlsx("Supplementary Table 1 - Coral Outplant Data.xlsx", sheet = "cleaned_genotype_data")
+
+coraloutplantmetadata %>% 
+  group_by(Species, SourceNursery, GenotypeName_Allyson) %>% 
+  summarise(count = n()) #%>%  #86 genotypes - counts > 1 reflect either clones that were combined, or treated vs untreated that were combined
+  #write_csv("number_of_genotypes.csv")
+
+outplant_monitoring_filtered_tidy %>% 
+  dplyr::rename(OriginalGenotype = Genotype, SourceNursery = ColonySource) %>% 
+  right_join(., coraloutplantmetadata, by = c("OriginalGenotype", "Species", "SourceNursery")) %>% 
+  dplyr::select(MI_CORRECTED, Region, Region_name, Site, Species, SourceNursery, NurseryType, ColonyNumber, GenotypeName_Allyson, Treated, Snails:SURVEY_MONTH) %>% 
+  mutate(Species = as.factor(Species), SourceNursery = as.factor(SourceNursery), NurseryType = as.factor(NurseryType), GenotypeName_Allyson = as.factor(GenotypeName_Allyson), Treated = as.factor(Treated), Snails = as.factor(Snails), FishBites = as.factor(FishBites), Bleach = as.factor(Bleach), STATUS_1 = as.factor(STATUS_1), DISEASECOND_1 = as.factor(DISEASECOND_1)) %>% 
+  distinct() -> outplant_monitoring_filtered_tidier
+
+str(outplant_monitoring_filtered_tidier)
+# region = 6 levels
+# species = 3 levels
+# source nursery = 5 levels
+# nursery type = 2 levels
+# genotype = 86 levels
+
+levels(outplant_monitoring_filtered_tidier$STATUS_1)
+# alive, dead, dead_m, missing
+
+levels(outplant_monitoring_filtered_tidier$DISEASECOND_1)
+#"BB"  "D"   "D_M" "DSD" "MIS" "ND"  "STL" "UNK"
+
+levels(outplant_monitoring_filtered_tidier$Bleach)
+#"B"  "N"  "P"  "PB"
+
+#write_csv(outplant_monitoring_filtered_tidier, "outplant_monitoring_filtered_tidier.csv")
+```
+
+
+### making summary tables to figure out how many bases were outplanted per genotype, site, region 
+
+```{r outplant Summary tables and sample sizes , include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring_filtered_tidier %>%
+  group_by(MI_CORRECTED, Species, Region) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!MI_CORRECTED) %>% 
+  group_by(Species, Region) %>% 
+  slice(which.max(count)) #%>% 
+  # drop_na() %>% 
+  # write_csv("total_bases_species_region.csv")
+#this should be the total number of bases outplanted at each site, separated by colony source and species. 1 base had 1 genotype, 5 fragments.
+
+outplant_monitoring_filtered_tidier %>%
+  group_by(MI_CORRECTED, Species, Region, GenotypeName_Allyson) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!c("MI_CORRECTED")) %>% 
+  group_by(Species, Region, GenotypeName_Allyson) %>% 
+  slice(which.max(count)) %>% 
+  drop_na() %>% 
+  ungroup() %>% 
+  group_by(Species, Region) %>% 
+  summarise(count_geno = n()) %>% 
+  write_csv("count_genotypes_per_region.csv")
+
+outplant_monitoring_filtered_tidier %>%
+  group_by(MI_CORRECTED, Species, Region, GenotypeName_Allyson, ColonyNumber) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!c("MI_CORRECTED")) %>% 
+  group_by(Species, Region, GenotypeName_Allyson, ColonyNumber) %>% 
+  slice(which.max(count)) %>% 
+  drop_na() %>% 
+  ungroup() %>% 
+  group_by(Species, Region, GenotypeName_Allyson) %>% 
+  summarise(count_colony = n()) 
+
+outplant_monitoring_filtered_tidier %>%
+  group_by(MI_CORRECTED, Species, SourceNursery, NurseryType) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!c("MI_CORRECTED")) %>% 
+  group_by( Species, SourceNursery, NurseryType) %>% 
+  slice(which.max(count)) %>% 
+  drop_na() %>% 
+  write_csv("source_nursery_counts.csv")
+```
+
+
+```{r number of coral bases per species per region, include = FALSE, warning=FALSE, message=FALSE}
+# in MI 2, Miami/Biscayne reported much lower numbers than the total count of bases 
+outplant_monitoring_filtered_tidier %>% 
+  group_by(SURVEY_MONTH, MI_CORRECTED, Region_name, Species) %>% 
+  summarise(count = n()) %>% 
+  distinct() %>% 
+  ggplot(., aes(x=MI_CORRECTED, y = count, fill = Species)) +
+  geom_bar(stat="identity", position = position_dodge(), color="black") +
+  facet_wrap(~Region_name, ncol = 1) +
+  theme_bw() +
+  # scale_x_date(
+  #   date_breaks = "2 month",
+  #   date_labels = "%b %Y",
+  # ) +
+  labs(x="Monitoring Interval", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("turquoise", "forestgreen", "maroon"))
+```
+
+
+```{r genotypes per site and region outplanted in this study, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring_filtered_tidy %>% 
+  group_by(MI_CORRECTED, Region, Species, ColonySource, Genotype, Site) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!MI_CORRECTED) %>% 
+  group_by(Species, ColonySource, Genotype, Region, Site) %>%
+  slice(which.max(count)) %>% 
+  ungroup() %>% 
+  dplyr::rename(OriginalGenotype = Genotype, SourceNursery = ColonySource) %>% 
+  left_join(., coraloutplantmetadata, by = c("OriginalGenotype", "Species", "SourceNursery")) %>% 
+  distinct() %>% #997
+  group_by(Species, SourceNursery, GenotypeName_Allyson, Region, Site) %>% 
+  summarise(count = n()) %>% #939
+  drop_na() #%>%  #928  
+  #write_csv("number_genotypes_outplanted_per_site_region.csv")
+
+outplant_monitoring_filtered_tidy %>% 
+  group_by(MI_CORRECTED, Region, Species, ColonySource, Genotype, Site) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!MI_CORRECTED) %>% 
+  group_by(Species, ColonySource, Genotype, Region) %>%
+  slice(which.max(count)) %>% 
+  ungroup() %>% 
+  dplyr::rename(OriginalGenotype = Genotype, SourceNursery = ColonySource) %>% 
+  left_join(., coraloutplantmetadata, by = c("OriginalGenotype", "Species", "SourceNursery")) %>% 
+  distinct() %>% 
+  group_by(Species, SourceNursery, GenotypeName_Allyson, Region) %>% 
+  summarise(count = n()) %>% #442
+  drop_na() #%>%  #431
+  #write_csv("allregions_species_genotypes.csv")
+```
+
+```{r list of genotypes and bases at each site, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring_filtered_tidy %>% 
+  group_by(MI_CORRECTED, Region, Species, ColonyNumber, ColonySource, Genotype, Site) %>% 
+  summarise(count = n()) %>% 
+  ungroup() %>% 
+  dplyr::select(!MI_CORRECTED) %>% 
+  group_by(Species, ColonySource, ColonyNumber, Genotype, Region, Site) %>%
+  slice(which.max(count)) %>% 
+  ungroup() %>% 
+  dplyr::rename(OriginalGenotype = Genotype, SourceNursery = ColonySource) %>% 
+  left_join(., coraloutplantmetadata, by = c("OriginalGenotype", "Species", "SourceNursery")) %>% 
+  dplyr::select(Species, SourceNursery, Region, Site,OriginalGenotype, GenotypeName_Allyson, ColonyNumber) %>% 
+  distinct() %>% #1,144
+  drop_na() #%>% #1,132
+  #write_csv("genotypes_bybase_outplanted_per_site_region.csv")
+```
+
+
+
+
+
+

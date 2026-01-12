@@ -1,0 +1,1341 @@
+---
+title: "Outplant Survivorship Analysis"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# load liraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(cowplot)
+library(ggpubr)
+library(glmmTMB)
+library(car)
+library(emmeans)
+library(DHARMa)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+# Set plot aesthetics
+theme_set(theme_classic())
+theme_update(text = element_text(size=14, family = "Helvetica", color = "black"),
+             axis.text = element_text(size=12, family = "Helvetica", color = "black"))
+```
+
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+# relevel regions so they go from north to south
+outplant_monitoring %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# Tidying dates for survey time points
+
+# Definitions:
+# SURVEY_MONTH which just means the month the monitoring was done (not accurate dates)
+# Date = exact survey date from fish survey data
+# Middle_MI_date = middle date for each MI across all regions
+
+# all corals were outplanted on May 4-6 2021. 
+# first monitoring for all regions was May 12 or 13, 2021.
+
+# for subsequent MI dates, to ensure that every survey groups together on the same time point (when looking at proportions of total outplants across regions) - pick the middle date for each MI across all regions.
+
+outplant_monitoring_with_dates %>% 
+  dplyr::select(MI_CORRECTED, Date) %>% 
+  distinct() %>% 
+  arrange(Date) %>% 
+  group_by(MI_CORRECTED) %>% 
+  slice(ceiling(n()/2)) %>% 
+  drop_na() %>% 
+  rename(Middle_MI_date = Date) -> middle_date_by_MI
+
+# there will be two types of days calculated - days based on monitoring interval middle date, and exact number of days based on the survey date (from the fish survey data). For any statistical tests using time, use the exact days. Monitoring interval will be reserved for grouping over time, or for visualizations.
+
+left_join(outplant_monitoring_with_dates, middle_date_by_MI, by = c("MI_CORRECTED")) %>% 
+  # use Date if it exists, otherwise Middle_MI_date
+  mutate(Date_Monitored = coalesce(Date, Middle_MI_date)) %>%
+  mutate(Exact_Days = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06"))) %>% 
+  mutate(Days_MI = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))) -> outplant_monitoring_days_survival
+
+outplant_monitoring_days_survival %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date, Middle_MI_date, Date_Monitored, Exact_Days, Days_MI) %>% 
+  distinct()
+
+# check that this worked
+outplant_monitoring_days_survival %>% 
+  filter(MI_CORRECTED == 21 & Region == 2)
+
+# create a column for “experienced predation” - fish bites was Yes and/or % live tissue area due to predation is > 0. Snails = no
+# Then make a column for cumulative predation - once it experienced predation, it gets a yes and then stays yes.
+# To account for multiple bites, use cumulative predation where it counts the total number of predation events - so experienced predation as “yes” converted to a number by the end of the data set
+
+outplant_monitoring_days_survival %>% 
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>% 
+  group_by(Region, Site, ColonyNumber) %>% 
+  mutate(Experienced_Predation = ifelse((FishBites == "yes" | PRED_1 > 0) & Snails == "no", "1", "0")) %>% 
+  mutate(Cumulative_Predation = ifelse(cumsum(ifelse(Experienced_Predation == "1", 1, 0)) > 0, "yes", "no")) %>% 
+  mutate(Total_Predation_Events = cumsum(ifelse(Experienced_Predation == "1", 1, 0))) %>% 
+  ungroup() %>% 
+  mutate(Species = case_when(Species == "MCAV" ~ "M. cavernosa",
+                             Species == "OFAV" ~ "O. faveolata",
+                             Species == "PCLI" ~ "P. clivosa")) %>% 
+   mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach County", "Broward County", "Miami-Dade County", "Monroe County (Upper Keys)", "Monroe County (Middle Keys)", "Monroe County (Lower Keys)")) -> outplant_monitoring_days_survival
+
+# note that Survival encodes 1 = alive, 0 = dead (opposite of kaplan-meier/cox proportional)
+outplant_monitoring_days_survival %>%
+  mutate(Survival = case_when(STATUS_2 == "alive" ~ 1,
+                              STATUS_2 %in% c("dead", "dead_m") ~ 0)) %>% # combine dead and dead_m (missing presumed dead)
+  # note that any "missing" corals will now be NA in Survival column
+  mutate(Species = as.factor(Species),
+         MI_CORRECTED = as.numeric(MI_CORRECTED),
+         Region = as.factor(Region),
+         Site = as.factor(Site),
+         SourceNursery = as.factor(SourceNursery),
+         STRATA = as.factor(STRATA),
+         GenotypeName_Allyson = as.factor(GenotypeName_Allyson),
+         ColonyNumber = as.factor(ColonyNumber),
+         Experienced_Predation = as.factor(Experienced_Predation),
+         Cumulative_Predation = as.factor(Cumulative_Predation)) %>% 
+  drop_na(Days_MI) -> outplant_monitoring_days_survival_glm
+```
+
+## Overall survivorship percentages
+```{r getting overall percentages, include=FALSE, warning=FALSE, message=FALSE}
+# all regions combined
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m + missing) %>% 
+  mutate(survivorship = alive/total) -> overall_survivorship_species
+
+# survivorship:
+# MCAV: 86%
+# OFAV: 78%
+# PCLI: 72%
+
+# by region
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m + missing) %>% 
+  mutate(survivorship = alive/total) -> overall_survivorship_species_regions
+  #write_csv("results_coral_survivorship_by_region.csv")
+
+# survivorship ranges from:
+# MCAV: 74-100%
+# OFAV: 73-87%
+# PCLI: 62-83%
+
+# by site
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, Site, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m + missing) %>% 
+  mutate(survivorship = alive/total) -> overall_survivorship_species_region_sites
+
+# by source nursery and site (for stats at site level, make sure you remove any that have only one outplant)
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, Site, SourceNursery, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m + missing) %>% 
+  mutate(survivorship = alive/total) -> overall_survivorship_species_region_site_sourcenursery
+
+# by source nursery (sites combined)
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, SourceNursery, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m + missing) %>% 
+  mutate(survivorship = alive/total) -> overall_survivorship_species_region_sourcenursery
+```
+
+### Proportion alive versus dead by end of experiment (bar plots)
+```{r proportion alive by end of experiment, echo=FALSE, warning=FALSE, message=FALSE}
+# species
+overall_survivorship_species %>% 
+  mutate(prop_surv=alive/total, prop_dead=(dead+dead_m)/total) %>% 
+  pivot_longer(prop_surv:prop_dead, names_to="prop") %>% 
+  ggplot(., aes(x=Species, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  theme_classic() +
+  scale_fill_manual(values = c("prop_dead" = "black", "prop_surv" = "lightgrey"), labels = c("Dead", "Alive")) +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(fill = "Status") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")
+  )  +
+  theme(legend.position = "none")
+
+# species and region
+overall_survivorship_species_regions %>% 
+  mutate(prop_surv=alive/total, prop_dead=(dead+dead_m)/total) %>% 
+  pivot_longer(prop_surv:prop_dead, names_to="prop") %>% 
+  ggplot(., aes(x=Species, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  theme_classic() +
+  scale_fill_manual(values = c("prop_dead" = "black", "prop_surv" = "lightgrey"), labels = c("Dead", "Alive")) +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_wrap(~Region_name) +
+  labs(fill = "Status") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")
+  ) +
+  theme(legend.position = "none")
+
+# species and region
+overall_survivorship_species_regions %>% 
+  mutate(prop_surv=alive/total, prop_dead=(dead+dead_m)/total) %>% 
+  pivot_longer(prop_surv:prop_dead, names_to="prop") %>% 
+  ggplot(., aes(x=Region_name, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  theme_classic() +
+  scale_fill_manual(values = c("prop_dead" = "black", "prop_surv" = "lightgrey"), labels = c("Dead", "Alive")) +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_wrap(~Species) +
+  labs(fill = "Status", x = "Region") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  theme(legend.position = "none") +
+  theme(strip.text.x = element_text(face = "italic")) +
+  theme(plot.margin = margin(t = 10, r = 10, b = 30, l = 30))
+#ggsave("plots/proportion_alive_by_end_of_experiment_byregion_species.pdf", width = 8, height = 5)
+
+# species, region, site
+overall_survivorship_species_region_sites %>% 
+  mutate(prop_surv=alive/total, prop_dead=(dead+dead_m)/total) %>% 
+  pivot_longer(prop_surv:prop_dead, names_to="prop") %>% 
+  ggplot(., aes(x=Site, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  theme_classic() +
+  scale_fill_manual(values = c("prop_dead" = "black", "prop_surv" = "lightgrey"), labels = c("Dead", "Alive")) +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_wrap(~Region_name+Species, ncol = 3) +
+  labs(fill = "Status") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")
+  ) +
+  theme(legend.position = "none")
+
+```
+
+
+## survivorship percentages by predation experience
+```{r}
+# all regions combined
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, STATUS_2, Cumulative_Predation) %>% 
+  summarise(count = n()) %>% 
+  unite("Status_Predation", STATUS_2, Cumulative_Predation, sep = " - ") %>% 
+  pivot_wider(names_from = "Status_Predation", values_from = "count") %>% 
+  mutate(across(c(`alive - no`:`missing - no`), ~ replace_na(.x, 0))) %>% 
+  mutate(total = sum(across(c(`alive - no`:`missing - no`))), prop_surv_pred=`alive - yes`/total, prop_surv_nopred =`alive - no`/total,  prop_dead_pred=(`dead - yes`+ `dead_m - yes`)/total, prop_dead_nopred=(`dead - no` + `dead_m - no`)/total) %>% 
+  pivot_longer(prop_surv_pred:prop_dead_nopred, names_to="prop") %>%
+  write_csv("results_coral_survivorship_by_predation_experience.csv")
+
+# by region
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, STATUS_2, Cumulative_Predation) %>% 
+  summarise(count = n()) %>% 
+  unite("Status_Predation", STATUS_2, Cumulative_Predation, sep = " - ") %>% 
+  pivot_wider(names_from = "Status_Predation", values_from = "count") %>% 
+  mutate(across(c(`alive - no`:`missing - no`), ~ replace_na(.x, 0))) %>% 
+  mutate(total = sum(across(c(`alive - no`:`missing - no`))), prop_surv_pred=`alive - yes`/total, prop_surv_nopred =`alive - no`/total,  prop_dead_pred=(`dead - yes`+ `dead_m - yes`)/total, prop_dead_nopred=(`dead - no` + `dead_m - no`)/total) %>% 
+  pivot_longer(prop_surv_pred:prop_dead_nopred, names_to="prop") %>% 
+  write_csv("results_coral_survivorship_by_region_predation_experience.csv")
+```
+
+
+#### Proportion alive versus dead by end of experiment, separated by predated or not (bar plots)
+
+```{r}
+# species
+p1<-outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, STATUS_2, Cumulative_Predation) %>% 
+  summarise(count = n()) %>% 
+  unite("Status_Predation", STATUS_2, Cumulative_Predation, sep = " - ") %>% 
+  pivot_wider(names_from = "Status_Predation", values_from = "count") %>% 
+  mutate(across(c(`alive - no`:`missing - no`), ~ replace_na(.x, 0))) %>% 
+  dplyr::select(!c(`missing - yes`, `missing - no`)) %>% # remove missing corals 
+  mutate(total = sum(across(c(`alive - no`:`dead_m - no`))), prop_surv_pred=`alive - yes`/total, prop_surv_nopred =`alive - no`/total,  prop_dead_pred=(`dead - yes`+ `dead_m - yes`)/total, prop_dead_nopred=(`dead - no` + `dead_m - no`)/total) %>% 
+  pivot_longer(prop_surv_pred:prop_dead_nopred, names_to="prop") %>% 
+  ggplot(., aes(x=Species, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  scale_fill_manual(values = c("prop_dead_nopred" = "bisque4", "prop_dead_pred" = "deepskyblue4", "prop_surv_nopred" = "antiquewhite", "prop_surv_pred" = "aliceblue"), labels = c("Dead - no predation", "Dead - predation", "Alive - no predation", "Alive - predation")) +
+  theme_classic() +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(fill = "Status") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")
+  )
+#ggsave("plots/proportion_alive_by_end_of_experiment_bypredation.pdf", width = 8, height = 5)
+```
+
+
+```{r}
+# species and region
+p2<-outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, STATUS_2, Cumulative_Predation) %>% 
+  summarise(count = n()) %>% 
+  unite("Status_Predation", STATUS_2, Cumulative_Predation, sep = " - ") %>% 
+  pivot_wider(names_from = "Status_Predation", values_from = "count") %>% 
+  mutate(across(c(`alive - no`:`missing - no`), ~ replace_na(.x, 0))) %>% 
+  dplyr::select(!c(`missing - yes`, `missing - no`)) %>% # remove missing corals 
+  mutate(total = sum(across(c(`alive - no`:`dead_m - no`))), prop_surv_pred=`alive - yes`/total, prop_surv_nopred =`alive - no`/total,  prop_dead_pred=(`dead - yes`+ `dead_m - yes`)/total, prop_dead_nopred=(`dead - no` + `dead_m - no`)/total) %>% 
+  pivot_longer(prop_surv_pred:prop_dead_nopred, names_to="prop") %>% 
+  ggplot(., aes(x=Species, y=value, fill=prop)) +
+  geom_bar(stat="identity", color="black") +
+  scale_fill_manual(values = c("prop_dead_nopred" = "bisque4", "prop_dead_pred" = "deepskyblue4", "prop_surv_nopred" = "antiquewhite", "prop_surv_pred" = "aliceblue"), labels = c("Dead - no predation", "Dead - predation", "Alive - no predation", "Alive - predation")) +
+  theme_classic() +
+  ylab("Proportion") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(fill = "Status") +
+  facet_wrap(~Region_name) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic")
+  )
+#ggsave("plots/proportion_alive_by_end_of_experiment_bypredation_region.pdf", width = 8, height = 5)
+```
+
+```{r}
+cowplot::plot_grid(p1 + theme(legend.position="none"), p2, ncol=2, align="v", labels=c("A", "B"), rel_widths = c(1, 2))
+#ggsave("plots/proportion_alive_by_end_of_experiment_bypredation_combined.pdf", width = 12, height = 7)
+```
+
+
+```{r}
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name, STATUS_2, Cumulative_Predation) %>% 
+  summarise(count = n()) %>% 
+  unite("Status_Predation", STATUS_2, Cumulative_Predation, sep = " - ") %>% 
+  pivot_wider(names_from = "Status_Predation", values_from = "count") %>% 
+  mutate(across(c(`alive - no`:`missing - no`), ~ replace_na(.x, 0))) %>% 
+  mutate(total = sum(across(c(`alive - no`:`missing - no`))), prop_surv_pred=`alive - yes`/total, prop_surv_nopred =`alive - no`/total,  prop_dead_pred=(`dead - yes`+ `dead_m - yes`)/total, prop_dead_nopred=(`dead - no` + `dead_m - no`)/total) %>% 
+  pivot_longer(prop_surv_pred:prop_dead_nopred, names_to="prop") %>% 
+  dplyr::select(Species, Region_name, prop, value) %>% 
+  filter(prop == "prop_dead_pred") %>%
+  arrange(desc(value))
+```
+
+
+
+# survivorship curves and stats
+
+This is overall survival probability, no inclusion of predation
+
+### graph of proportion survived over time
+```{r}
+species_colors <- c(
+  "M. cavernosa" = "#CC5500",  # Burnt orange
+  "P. clivosa" = "#E1AD01",  # Mustard yellow
+  "O. faveolata" = "#5A8754"   # Forest green
+)
+# when combining regions, you have to do monitoring interval level, otherwise totals of outplants get all messed up
+
+#species, all regions combined
+p1<-outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+  ylim(0,1.05) +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  theme(legend.position = "none") +
+   theme(
+    text = element_text(size=12)
+  ) +
+  scale_color_manual(values = species_colors)
+
+#species x regions
+p2<-outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+  ylim(0,1.05) +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  scale_color_manual(values = species_colors)
+
+cowplot::plot_grid(p1, p2, ncol=2, labels=c("A", "B"), rel_widths = c(0.8, 1.5))
+#ggsave("plots/survivorship_over_time_by_region_combined_species.pdf", width = 13, height = 6)
+
+#species x regions x sites
+outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, Site, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Site, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.25), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+Site, ncol = 4) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  scale_color_manual(values = species_colors)
+#ggsave("plots/survivorship_over_time_by_region_site_species.pdf", width = 10, height = 12)
+
+#species x regions x sites - only region 1 because that's the only significant one
+p3<-outplant_monitoring_days_survival_glm %>% 
+  filter(Region == 1) %>% 
+  dplyr::select(Species, Region_name, Site, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Site, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05),
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+Site, ncol = 4) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  scale_color_manual(values = species_colors)
+
+
+#species x regions x strata
+outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, STRATA, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, STRATA, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.25), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+STRATA, ncol = 2) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  scale_color_manual(values = species_colors)
+#ggsave("plots/survivorship_over_time_by_region_strata_species.pdf", width = 10, height = 12)
+
+#species x strata
+p4<-outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, STRATA, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, STRATA, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~STRATA, ncol = 2) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = species_colors)
+#ggsave("plots/survivorship_over_time_by_strata_species.pdf", width = 6, height = 5)
+
+cowplot::plot_grid(p1,p2,p4 + theme(legend.position="none"), p3, ncol=2, labels=c("A", "B", "C", "D"), rel_widths = c(0.8, 1.5))
+#ggsave("plots/survivorship_over_time_by_region_strata_site_combined_species.pdf", width = 13, height = 10)
+```
+
+
+just species x strata for manuscript
+```{r}
+p1<-outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, STRATA, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, STRATA, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=Species)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~STRATA, ncol = 2) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = species_colors)
+#ggsave("plots/survivorship_over_time_by_strata_species_for_manuscript.pdf", width = 6, height = 3)
+```
+
+
+
+Source Nursery
+
+do species separately since different species have different source nurseries
+
+M. cavernosa
+```{r}
+source_nursery_colors <- c(
+  "UM" = "#1B4D3E",  # Dark forest green
+  "MML" = "#00B4D8",   # Bright cyan blue
+  "CRF" = "#E76F51",  # Coral/burnt orange
+  "RR" = "#6A4C93",   # Deep purple
+  "FWC" = "#F4A261"   # Golden sand
+)
+
+
+# region
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "M. cavernosa") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+
+# region x strata
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "M. cavernosa") %>% 
+  dplyr::select(Species, Region_name, STRATA, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, STRATA, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+STRATA) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+
+# region x site
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "M. cavernosa") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Site, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+Site, ncol = 4) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+#ggsave("plots/survivorship_over_time_by_region_site_source_nursery_MCAV.pdf", width = 10, height = 12)
+```
+
+O. faveolata
+```{r}
+# region
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "O. faveolata") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+
+# region x site
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "O. faveolata") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Site, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   # scale_y_continuous(limits = c(0, 1.25), 
+   #                   breaks = c(0, 0.5, 1),  # Exact breaks you want
+   #                   expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+Site, ncol = 4) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+#ggsave("plots/survivorship_over_time_by_region_site_source_nursery_OFAV.pdf", width = 10, height = 12)
+```
+
+P. clivosa
+```{r}
+# region
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "P. clivosa") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   scale_y_continuous(limits = c(0, 1.05), 
+                     breaks = c(0, 0.5, 1),  # Exact breaks you want
+                     expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = source_nursery_colors)
+
+# region x site
+outplant_monitoring_days_survival_glm %>% 
+  filter(Species == "P. clivosa") %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, Region_name, Site, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   # scale_y_continuous(limits = c(0, 1.25), 
+   #                   breaks = c(0, 0.5, 1),  # Exact breaks you want
+   #                   expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Region_name+Site, ncol = 4) +
+  theme(
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  )+
+  scale_color_manual(values = region_colors)
+#ggsave("plots/survivorship_over_time_by_region_site_source_nursery_PCLI.pdf", width = 10, height = 12)
+```
+
+plot all species together 
+```{r}
+p2<-outplant_monitoring_days_survival_glm %>% 
+  dplyr::select(Species, Region_name, Site, SourceNursery, STATUS_2, ColonyNumber, Days_MI) %>%
+  group_by(Species, SourceNursery, Days_MI, STATUS_2) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "STATUS_2", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(alive, dead, dead_m, missing), ~ replace_na(.x, 0))) %>% 
+  mutate(total = alive + dead + dead_m) %>% # don't include missing because it may mean it wasn't monitored
+  mutate(survivorship = alive/total) %>% 
+  ggplot(., aes(x=Days_MI, y=survivorship, color=SourceNursery)) +
+  geom_smooth(se=F) +
+  theme_classic() +
+   # scale_y_continuous(limits = c(0, 1.25), 
+   #                   breaks = c(0, 0.5, 1),  # Exact breaks you want
+   #                   expand = c(0, 0))  +
+  labs(y="Survivorship", x = "Days Since Outplanting") +
+  facet_wrap(~Species) +
+  theme(
+    text = element_text(size=12),
+    strip.text = element_text(face = "italic")
+  )+
+  scale_color_manual(values = source_nursery_colors) +
+  ylim(0,1.05)
+#ggsave("plots/survivorship_over_time_by_source_nursery_all_species.pdf", width = 10, height = 6)
+```
+
+### manuscript plots
+```{r}
+plot_grid(p1, p2, ncol=1, labels=c("A", "B"), rel_widths = c(0.8, 1.2))
+ggsave("plots/survivorship_over_time_by_strata_species_and_source_nursery_all_species_for_manuscript.pdf", width = 8, height = 6)
+```
+
+
+
+
+### GLMMs and emmeans for survivorship at end of experiment (MI 25)
+
+#### model selection
+
+```{r}
+# test the following fixed effects: species, region, strata
+# Region_Site as a random effect
+# (1|Region_Site): Accounts for variation among the 4 sites within each region without estimating 24 separate site parameters
+# since it is one time point, you do not need to include a random effect for coral ID
+
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  filter(STATUS_2 != "missing") %>% 
+  unite("Region_Site", Region, Site, sep = "_", remove = FALSE) -> outplant_monitoring_days_survival_glm_end
+# remove missing corals
+# can't include source nursery because of singularity issues (some nurseries only have one species)
+
+species_model <- glmmTMB(
+  Survival ~ Species + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "logit")
+)
+
+glmm_surv_species_model <- summary(species_model)
+# AIC = 1124.2
+capture.output(glmm_surv_species_model, file = "species_survivorship_glmm_summary.txt")
+
+species_region_model <- glmmTMB(
+  Survival ~ Species*Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "logit")
+)
+
+glmm_surv_species_region_model <- summary(species_region_model)
+# AIC = 1132.7
+
+species_region_strata_model <- glmmTMB(
+  Survival ~ Species*Region + STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end)
+
+glmm_surv_species_region_strata_model <- summary(species_region_strata_model)
+# AIC = 1154.5
+
+species_region_strata_model_int <- glmmTMB(
+  Survival ~ Species*Region + Species*STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end
+)
+
+summary(species_region_strata_model_int)
+# AIC = 1153.4
+
+species_strata_model <- glmmTMB(
+  Survival ~ Species*STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "logit")
+)
+
+glmm_surv_species_strata_model <- summary(species_strata_model)
+#capture.output(glmm_surv_species_strata_model, file = "species_strata_survivorship_glmm_summary.txt")
+# AIC = 1118.9
+
+# lowest AIC is species x strata
+
+species_strata_anova_results <- Anova(species_strata_model, type = "II")
+# as.data.frame(species_strata_anova_results) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("species_strata_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_species_strata_model <- simulateResiduals(species_strata_model)
+plot(sim_res_species_strata_model)
+
+# predicted probabilities 
+outplant_monitoring_days_survival_glm_end$predicted_prob_species_strata <- predict(species_strata_model, type = "response")
+```
+
+```{r}
+species_strata_pairs <- emmeans(species_strata_model, pairwise ~ "Species*STRATA", adjust = "tukey")
+
+#write.csv(as.data.frame(species_strata_pairs$contrasts), "emmeans_contrasts_coral_survivorship_species_strata.csv", row.names = FALSE)
+```
+
+
+#### (archive) Species x Region model for end of experiment survivorship
+
+```{r}
+# Species and Region as fixed effects, site as random effect nested within region
+# (1|Region_Site): Accounts for variation among the 4 sites within each region without estimating 24 separate site parameters
+
+# can't include source nursery because of singularity issues (some nurseries only have one species)
+
+species_region_model <- glmmTMB(
+  Survival ~ Species*Region + (1|Region_Site) + (1|ColonyNumber),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "logit")
+)
+
+summary(species_region_model)
+capture.output(summary(species_region_model), file = "species_region_survivorship_glmm_summary.txt")
+
+species_region_anova_results <- Anova(species_region_model, type = "III")
+# as.data.frame(species_region_anova_results) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("species_region_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_species_region_model <- simulateResiduals(species_region_model)
+plot(sim_res_species_region_model)
+
+# predicted probabilities 
+outplant_monitoring_days_survival_glm_end$predicted_prob_species_region <- predict(species_region_model, type = "response")
+```
+
+
+```{r}
+species_region_pairs <- emmeans(species_region_model, pairwise ~ "Species|Region", adjust = "tukey")
+
+#write.csv(as.data.frame(species_region_pairs$contrasts), "emmeans_contrasts_coral_survivorship_species_region.csv", row.names = FALSE)
+```
+
+
+#### (archive) Species x Region x Sites model for end of experiment survivorship
+
+```{r}
+# Species and Region_Site as fixed effects
+
+species_site_region_model <- glmmTMB(
+  Survival ~ Species*Region_Site + (1|ColonyNumber),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "cloglog"),
+  control = glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS")))
+
+summary(species_site_region_model)
+species_site_region_anova_results<-Anova(species_site_region_model, type = "III")
+# as.data.frame(species_site_region_anova_results) %>%
+# rownames_to_column(var = "Term") %>%
+#  write_csv("species_site_region_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_species_site_region_model <- simulateResiduals(species_site_region_model)
+plot(sim_res_species_site_region_model)
+
+# predicted probabilities 
+outplant_monitoring_days_survival_glm_end$predicted_prob_species_region_site <- predict(species_site_region_model, type = "response")
+```
+
+```{r}
+species_site_region_pairs <- emmeans(species_site_region_model, pairwise ~ "Species|Region_Site", adjust = "tukey")
+
+# write.csv(as.data.frame(species_site_region_pairs$contrasts), "emmeans_contrasts_coral_survivorship_species_regions_sites.csv", row.names = FALSE)
+```
+
+
+#### (archive) Species x Strata model for end of experiment survivorship
+
+Since there doesn't seem to be an effect of region on survivorship, we can just group them all together and only look at strata
+
+```{r}
+# Species and STRATA as fixed effects
+
+species_strata_model <- glmmTMB(
+  Survival ~ Species*STRATA + (1|Region) + (1|ColonyNumber),
+  data = outplant_monitoring_days_survival_glm_end,
+  family = binomial(link = "logit"))
+
+summary(species_strata_model)
+species_strata_model_anova_results<-Anova(species_strata_model, type = "III")
+# as.data.frame(species_strata_model_anova_results) %>%
+#   rownames_to_column(var = "Term") %>%  
+#   write_csv("species_strata_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_species_strata_model <- simulateResiduals(species_strata_model)
+plot(sim_res_species_strata_model)
+```
+
+```{r}
+species_strata_pairs <- emmeans(species_strata_model, pairwise ~ "Species*STRATA", adjust = "tukey")
+
+species_strata_pairs$contrasts
+
+# write.csv(as.data.frame(species_strata_pairs$contrasts), "emmeans_contrasts_coral_survivorship_species_strata.csv", row.names = FALSE)
+```
+
+
+#### Source Nursery (MCAV only) model for end of experiment survivorship
+
+```{r}
+# Source Nursery as fixed effect
+
+outplant_monitoring_days_survival_glm_end %>% 
+  filter(Species == "M. cavernosa") -> outplant_monitoring_days_survival_glm_end_MCAV
+
+MCAV_sourcenursery_model <- glmmTMB(
+  Survival ~ SourceNursery + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+summary(MCAV_sourcenursery_model)
+# AIC 167.6
+
+MCAV_sourcenursery_region_model <- glmmTMB(
+  Survival ~ SourceNursery + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+
+summary(MCAV_sourcenursery_region_model)
+# AIC 166.8
+
+MCAV_sourcenursery_strata_model <- glmmTMB(
+  Survival ~ SourceNursery + STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+
+summary(MCAV_sourcenursery_strata_model)
+# AIC 164.8
+
+MCAV_sourcenursery_strata_region_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+
+summary(MCAV_sourcenursery_strata_region_interaction_model)
+# AIC 162.7
+
+MCAV_sourcenursery_strata_region_interaction_model_2 <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + SourceNursery*Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+
+summary(MCAV_sourcenursery_strata_region_interaction_model_2)
+# doesn't work
+
+MCAV_sourcenursery_strata_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_MCAV,
+  family = binomial(link = "logit"))
+
+summary(MCAV_sourcenursery_strata_interaction_model)
+# AIC 165.9
+
+
+# best model is strata and region
+# residual diagnostics (DHARMA)
+sim_res_MCAV_sourcenursery_strata_region_interaction_model <- simulateResiduals(MCAV_sourcenursery_strata_region_interaction_model)
+plot(sim_res_MCAV_sourcenursery_strata_region_interaction_model)
+
+MCAV_sourcenursery_model_anova_results<-Anova(MCAV_sourcenursery_strata_region_interaction_model, type = "II")
+as.data.frame(MCAV_sourcenursery_model_anova_results) %>%
+  rownames_to_column(var = "Term") %>%
+  write_csv("MCAV_sourcenursery_survivorship_anova_results.csv")
+
+```
+
+```{r}
+MCAV_sourcenursery_strata_pairs <- emmeans(MCAV_sourcenursery_strata_region_interaction_model, pairwise ~ "SourceNursery*STRATA", adjust = "tukey")
+
+MCAV_sourcenursery_pairs$contrasts
+
+# write.csv(as.data.frame(MCAV_sourcenursery_strata_pairs$contrasts), "emmeans_contrasts_coral_survivorship_MCAV_sourcenursery_strata.csv", row.names = FALSE)
+```
+
+
+#### Source Nursery (OFAV only) model for end of experiment survivorship
+
+```{r}
+# Source Nursery as fixed effect
+
+outplant_monitoring_days_survival_glm_end %>% 
+  filter(Species == "O. faveolata") -> outplant_monitoring_days_survival_glm_end_OFAV
+
+OFAV_sourcenursery_model <- glmmTMB(
+  Survival ~ SourceNursery + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_OFAV,
+  family = binomial(link = "logit"))
+summary(OFAV_sourcenursery_model)
+# AIC 637.1
+
+OFAV_sourcenursery_region_model <- glmmTMB(
+  Survival ~ SourceNursery + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_OFAV,
+  family = binomial(link = "logit"))
+
+summary(OFAV_sourcenursery_region_model)
+# AIC 644.9
+
+OFAV_sourcenursery_strata_model <- glmmTMB(
+  Survival ~ SourceNursery + STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_OFAV,
+  family = binomial(link = "logit"))
+
+summary(OFAV_sourcenursery_strata_model)
+# AIC 637.9
+
+OFAV_sourcenursery_strata_region_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_OFAV,
+  family = binomial(link = "logit"))
+
+summary(OFAV_sourcenursery_strata_region_interaction_model)
+# AIC 648.4
+
+OFAV_sourcenursery_strata_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_OFAV,
+  family = binomial(link = "logit"))
+
+summary(OFAV_sourcenursery_strata_interaction_model)
+# AIC 640.7
+
+# best model is just source nursery
+
+summary(OFAV_sourcenursery_model)
+OFAV_sourcenursery_model_anova_results<-Anova(OFAV_sourcenursery_model, type = "II")
+# as.data.frame(OFAV_sourcenursery_model_anova_results) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("OFAV_sourcenursery_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_OFAV_sourcenursery_model <- simulateResiduals(OFAV_sourcenursery_model)
+plot(sim_res_OFAV_sourcenursery_model)
+```
+
+```{r}
+OFAV_sourcenursery_pairs <- emmeans(OFAV_sourcenursery_model, pairwise ~ "SourceNursery", adjust = "tukey")
+
+OFAV_sourcenursery_pairs$contrasts
+
+# write.csv(as.data.frame(OFAV_sourcenursery_pairs$contrasts), "emmeans_contrasts_coral_survivorship_OFAV_sourcenursery.csv", row.names = FALSE)
+```
+
+
+#### Source Nursery (PCLI only) model for end of experiment survivorship
+
+```{r}
+# Source Nursery as fixed effect
+
+outplant_monitoring_days_survival_glm_end %>% 
+  filter(Species == "P. clivosa") -> outplant_monitoring_days_survival_glm_end_PCLI
+
+PCLI_sourcenursery_model <- glmmTMB(
+  Survival ~ SourceNursery + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_PCLI,
+  family = binomial(link = "logit"))
+summary(PCLI_sourcenursery_model)
+#AIC 301.3
+
+PCLI_sourcenursery_region_model <- glmmTMB(
+  Survival ~ SourceNursery + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_PCLI,
+  family = binomial(link = "logit"))
+
+summary(PCLI_sourcenursery_region_model)
+# AIC 307.1
+
+PCLI_sourcenursery_strata_model <- glmmTMB(
+  Survival ~ SourceNursery + STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_PCLI,
+  family = binomial(link = "logit"))
+
+summary(PCLI_sourcenursery_strata_model)
+# capture.output(summary(PCLI_sourcenursery_strata_model), file = "PCLI_sourcenursery_strata_survivorship_glmm_summary.txt")
+# AIC 299.2
+
+PCLI_sourcenursery_strata_region_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + Region + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_PCLI,
+  family = binomial(link = "logit"))
+
+summary(PCLI_sourcenursery_strata_region_interaction_model)
+# AIC 305.5
+
+PCLI_sourcenursery_strata_interaction_model <- glmmTMB(
+  Survival ~ SourceNursery*STRATA + (1|Region_Site),
+  data = outplant_monitoring_days_survival_glm_end_PCLI,
+  family = binomial(link = "logit"))
+
+summary(PCLI_sourcenursery_strata_interaction_model)
+# AIC 300.9
+
+# best model is source nursery x strata
+
+PCLI_sourcenursery_model_anova_results<-Anova(PCLI_sourcenursery_strata_model, type = "II")
+# as.data.frame(PCLI_sourcenursery_model_anova_results) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("PCLI_sourcenursery_survivorship_anova_results.csv")
+
+# residual diagnostics (DHARMA)
+sim_res_PCLI_sourcenursery_model <- simulateResiduals(PCLI_sourcenursery_strata_model)
+plot(sim_res_PCLI_sourcenursery_model)
+```
+
+```{r}
+PCLI_sourcenursery_pairs <- emmeans(PCLI_sourcenursery_strata_model, pairwise ~ "SourceNursery", adjust = "tukey")
+
+PCLI_sourcenursery_pairs$contrasts
+
+#write.csv(as.data.frame(PCLI_sourcenursery_pairs$contrasts), "emmeans_contrasts_coral_survivorship_PCLI_sourcenursery.csv", row.names = FALSE)
+```
+
+
+### (archive) Graphs of predicted probability of survival at the end of the experiment
+
+Species
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Species) %>% 
+  summarise(mean_prob = mean(predicted_prob_species), se_prob = std.error(predicted_prob_species)) %>% 
+ggplot(., aes(x = Species, y = mean_prob, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2) +
+  theme(panel.grid = element_blank()) +
+  ylim(0,1) +
+  labs(y="Predicted Probability of Survival", x = "Species") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) 
+```
+
+
+Species x Region
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Region_name, Species) %>% 
+  summarise(mean_prob = mean(predicted_prob_species_region), se_prob = std.error(predicted_prob_species_region)) %>% 
+ggplot(., aes(x = Region_name, y = mean_prob, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2) +
+  theme(panel.grid = element_blank()) +
+  ylim(0,1) +
+  labs(y="Predicted Probability of Survival", x = "Region") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) 
+```
+
+Species x Region x Site
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Region_name, Site, Species) %>% 
+  summarise(mean_prob = mean(predicted_prob_species_region_site), se_prob = std.error(predicted_prob_species_region_site)) %>% 
+ggplot(., aes(x = Site, y = mean_prob, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2) +
+  theme(panel.grid = element_blank()) +
+  ylim(0,1) +
+  labs(y="Predicted Probability of Survival", x = "Site") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  facet_wrap(~Region_name)
+```
+
+
+
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Region_name, Species, SourceNursery) %>% 
+  summarise(mean_prob = mean(predicted_prob), se_prob = std.error(predicted_prob)) %>% 
+ggplot(., aes(x = SourceNursery, y = mean_prob, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2) +
+  theme(panel.grid = element_blank()) +
+  ylim(0,1) +
+  labs(y="Predicted Probability of Survival", x = "Source Nursery") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  facet_wrap(~Region_name)
+```
+
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Region_name, Species, STRATA) %>% 
+  summarise(mean_prob = mean(predicted_prob), se_prob = std.error(predicted_prob)) %>% 
+ggplot(., aes(x = STRATA, y = mean_prob, color = Species)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2) +
+  theme(panel.grid = element_blank()) +
+  ylim(0,1) +
+  labs(y="Predicted Probability of Survival", x = "Strata") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=12)
+  ) +
+  facet_wrap(~Region_name)
+```
+
+
+```{r, warning=FALSE}
+outplant_monitoring_days_survival_glm_end %>% 
+  group_by(Region_name, Species, SourceNursery, STRATA) %>% 
+  summarise(count = n(), mean_prob = mean(predicted_prob), se_prob = std.error(predicted_prob)) %>% 
+ggplot(., aes(x = Species, y = mean_prob, color = SourceNursery)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = mean_prob - se_prob, ymax = mean_prob + se_prob), width = 0.2, position = position_dodge(width = 0.5)) +
+  theme(panel.grid = element_blank()) +
+  labs(y="Predicted Probability of Survival", x = "Species", color="Source Nursery") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1,face = "italic"),
+    text = element_text(size=12)
+  ) +
+  facet_wrap(~Region_name+STRATA, ncol=2)
+#ggsave("plots/predicted_probability_of_survival_by_species_sourcenursery_strata_region.pdf", width = 6, height = 10)
+```
+
+
+
+
+
