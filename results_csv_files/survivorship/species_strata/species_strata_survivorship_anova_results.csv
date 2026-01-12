@@ -1,0 +1,4 @@
+Term,Chisq,Df,Pr(>Chisq)
+Species,15.279,2,4.81E-04
+STRATA,5.737,1,0.0166
+Species:STRATA,5.478,2,0.0646

@@ -1,0 +1,25 @@
+ Family: binomial  ( logit )
+Formula:          Survival ~ PRED_1 * Species + STRATA + (1 | Region:Site)
+Data: surv_vs_predation_30days
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+   1108.7    1149.0    -546.4    1092.7      1119 
+
+Random effects:
+
+Conditional model:
+ Groups      Name        Variance Std.Dev.
+ Region:Site (Intercept) 0.3336   0.5776  
+Number of obs: 1127, groups:  Region:Site, 24
+
+Conditional model:
+                           Estimate Std. Error z value Pr(>|z|)    
+(Intercept)                  2.6895     0.3124   8.609  < 2e-16 ***
+PRED_1                      -7.1745     2.3886  -3.004 0.002667 ** 
+SpeciesO. faveolata         -0.8875     0.2612  -3.397 0.000681 ***
+SpeciesP. clivosa           -1.2132     0.2840  -4.271 1.94e-05 ***
+STRATAOffshore              -0.7060     0.2862  -2.467 0.013622 *  
+PRED_1:SpeciesO. faveolata   7.5035     2.9098   2.579 0.009917 ** 
+PRED_1:SpeciesP. clivosa     3.6475     2.9200   1.249 0.211617    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1

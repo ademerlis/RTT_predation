@@ -1,0 +1,22 @@
+ Family: binomial  ( logit )
+Formula:          Survival ~ Species + (1 | Region_Site) + (1 | ColonyNumber)
+Data: outplant_monitoring_days_survival_glm_end
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+   1126.2    1151.3    -558.1    1116.2      1123 
+
+Random effects:
+
+Conditional model:
+ Groups       Name        Variance  Std.Dev. 
+ Region_Site  (Intercept) 4.315e-01 0.6569086
+ ColonyNumber (Intercept) 9.982e-08 0.0003159
+Number of obs: 1128, groups:  Region_Site, 24; ColonyNumber, 1128
+
+Conditional model:
+                    Estimate Std. Error z value Pr(>|z|)    
+(Intercept)           2.0096     0.2451   8.198 2.45e-16 ***
+SpeciesO. faveolata  -0.5689     0.2247  -2.532   0.0113 *  
+SpeciesP. clivosa    -0.9986     0.2469  -4.045 5.24e-05 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1

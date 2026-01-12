@@ -1,0 +1,23 @@
+ Family: binomial  ( logit )
+Formula:          Survival ~ SourceNursery + STRATA + (1 | Region_Site)
+Data: outplant_monitoring_days_survival_glm_end_PCLI
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+    299.2     320.6    -143.6     287.2       259 
+
+Random effects:
+
+Conditional model:
+ Groups      Name        Variance Std.Dev.
+ Region_Site (Intercept) 0.3755   0.6128  
+Number of obs: 265, groups:  Region_Site, 24
+
+Conditional model:
+                 Estimate Std. Error z value Pr(>|z|)    
+(Intercept)        2.0825     0.3746   5.559 2.71e-08 ***
+SourceNurseryMML  -1.5675     0.4376  -3.582 0.000341 ***
+SourceNurseryRR   -0.6189     0.4014  -1.542 0.123090    
+SourceNurseryUM   -0.8394     0.4047  -2.074 0.038090 *  
+STRATAOffshore    -0.8436     0.3970  -2.125 0.033599 *  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1

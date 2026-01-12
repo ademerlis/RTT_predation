@@ -1,0 +1,37 @@
+ Family: binomial  ( logit )
+Formula:          Survival ~ Species * Region + (1 | Region_Site) + (1 | ColonyNumber)
+Data: outplant_monitoring_days_survival_glm_end
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+   1134.7    1235.2    -547.3    1094.7      1108 
+
+Random effects:
+
+Conditional model:
+ Groups       Name        Variance  Std.Dev. 
+ Region_Site  (Intercept) 3.320e-01 0.5762317
+ ColonyNumber (Intercept) 2.568e-08 0.0001602
+Number of obs: 1128, groups:  Region_Site, 24; ColonyNumber, 1128
+
+Conditional model:
+                             Estimate Std. Error z value Pr(>|z|)    
+(Intercept)                    2.4584     0.6730   3.653  0.00026 ***
+SpeciesO. faveolata           -1.0905     0.6539  -1.668  0.09538 .  
+SpeciesP. clivosa             -1.9143     0.6834  -2.801  0.00509 ** 
+Region2                       -1.3599     0.8248  -1.649  0.09919 .  
+Region3                       -0.8828     0.8535  -1.034  0.30098    
+Region4                       -0.1628     0.9176  -0.177  0.85921    
+Region5                       18.8045  6151.4644   0.003  0.99756    
+Region6                       -0.7280     0.8634  -0.843  0.39912    
+SpeciesO. faveolata:Region2    1.1708     0.7890   1.484  0.13783    
+SpeciesP. clivosa:Region2      1.8697     0.8546   2.188  0.02868 *  
+SpeciesO. faveolata:Region3    0.9597     0.8223   1.167  0.24316    
+SpeciesP. clivosa:Region3      2.0129     0.9022   2.231  0.02567 *  
+SpeciesO. faveolata:Region4    0.3574     0.8888   0.402  0.68755    
+SpeciesP. clivosa:Region4      0.6832     0.9459   0.722  0.47013    
+SpeciesO. faveolata:Region5  -18.1957  6151.4644  -0.003  0.99764    
+SpeciesP. clivosa:Region5    -18.0999  6151.4644  -0.003  0.99765    
+SpeciesO. faveolata:Region6    0.4514     0.8268   0.546  0.58507    
+SpeciesP. clivosa:Region6      0.7139     0.8855   0.806  0.42011    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1

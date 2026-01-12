@@ -1,0 +1,27 @@
+ Family: binomial  ( logit )					
+Formula:          Cumulative_Predation ~ Species + Region + STRATA + (1 | Region_Site)					
+Data: end_of_study_data					
+					
+      AIC       BIC    logLik -2*log(L)  df.resid 					
+    863.6     913.9    -421.8     843.6      1122 					
+					
+Random effects:					
+					
+Conditional model:					
+Groups	Name	Variance	Std.Dev.		
+Region_Site	(Intercept)	0.2575	0.5075		
+"Number of obs: 1132, groups:  Region_Site, 24"					
+					
+Conditional model:					
+                    Estimate Std. Error z value Pr(>|z|)    					
+(Intercept)	-2.62457	0.43431	-6.043	1.51E-09	***
+SpeciesO. faveolata	0.03357	0.23249	0.144	0.885	
+SpeciesP. clivosa	-0.33568	0.26807	-1.252	0.21	
+Region2	6.27343	0.67947	9.233	< 2e-16	***
+Region3	4.95585	0.53783	9.215	< 2e-16	***
+Region4	3.95501	0.48882	8.091	5.92E-16	***
+Region5	4.01818	0.50559	7.947	1.90E-15	***
+Region6	2.63689	0.46599	5.659	1.53E-08	***
+STRATAOffshore	0.78006	0.29414	2.652	0.008	**
+---					
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1					

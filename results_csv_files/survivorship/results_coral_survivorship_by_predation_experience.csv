@@ -1,0 +1,13 @@
+Species,alive - no,alive - yes,dead - no,dead - yes,dead_m - yes,missing - yes,dead_m - no,missing - no,total,prop,value
+M. cavernosa,57,135,7,20,3,1,0,0,223,prop_surv_pred,0.6053811659192825
+M. cavernosa,57,135,7,20,3,1,0,0,223,prop_surv_nopred,0.2556053811659193
+M. cavernosa,57,135,7,20,3,1,0,0,223,prop_dead_pred,0.1031390134529148
+M. cavernosa,57,135,7,20,3,1,0,0,223,prop_dead_nopred,0.03139013452914798
+O. faveolata,141,364,36,87,8,2,5,1,644,prop_surv_pred,0.5652173913043478
+O. faveolata,141,364,36,87,8,2,5,1,644,prop_surv_nopred,0.21894409937888198
+O. faveolata,141,364,36,87,8,2,5,1,644,prop_dead_pred,0.14751552795031056
+O. faveolata,141,364,36,87,8,2,5,1,644,prop_dead_nopred,0.06366459627329192
+P. clivosa,55,135,29,42,2,0,2,0,265,prop_surv_pred,0.5094339622641509
+P. clivosa,55,135,29,42,2,0,2,0,265,prop_surv_nopred,0.20754716981132076
+P. clivosa,55,135,29,42,2,0,2,0,265,prop_dead_pred,0.1660377358490566
+P. clivosa,55,135,29,42,2,0,2,0,265,prop_dead_nopred,0.1169811320754717

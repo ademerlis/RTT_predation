@@ -1,0 +1,5 @@
+Term,Chisq,Df,Pr(>Chisq)
+Region,104.469,5,6.03E-21
+STRATA,14.130,1,1.71E-04
+SourceNursery,12.683,4,0.013
+Region:STRATA,10.798,5,0.056

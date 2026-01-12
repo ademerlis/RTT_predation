@@ -1,0 +1,45 @@
+ Family: beta  ( logit )
+Formula:          PRED_1 ~ Species + Region + (1 | Region_Site) + (1 | Days_MI) +      (1 | ColonyNumber) + (1 | obs_id)
+Zero inflation:          ~Species + Region
+Data: first_30_days_data
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+    -73.0      55.1      57.5    -115.0      3280 
+
+Random effects:
+
+Conditional model:
+ Groups       Name        Variance Std.Dev.
+ Region_Site  (Intercept) 0.08992  0.2999  
+ Days_MI      (Intercept) 0.01972  0.1404  
+ ColonyNumber (Intercept) 0.44887  0.6700  
+ obs_id       (Intercept) 0.70381  0.8389  
+Number of obs: 3301, groups:  Region_Site, 24; Days_MI, 3; ColonyNumber, 1132; obs_id, 3301
+
+Dispersion parameter for beta family (): 1.04e+08 
+
+Conditional model:
+                    Estimate Std. Error z value Pr(>|z|)    
+(Intercept)         -2.72523    0.57824  -4.713 2.44e-06 ***
+SpeciesO. faveolata -0.41630    0.09221  -4.515 6.34e-06 ***
+SpeciesP. clivosa   -0.28638    0.10760  -2.661  0.00778 ** 
+Region2              0.32129    0.59212   0.543  0.58740    
+Region3              0.27649    0.59247   0.467  0.64073    
+Region4              0.49808    0.59447   0.838  0.40211    
+Region5              0.08409    0.59591   0.141  0.88779    
+Region6             -0.08438    0.59808  -0.141  0.88780    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Zero-inflation model:
+                    Estimate Std. Error z value Pr(>|z|)    
+(Intercept)           4.5917     0.5075   9.047  < 2e-16 ***
+SpeciesO. faveolata   0.4956     0.1090   4.549 5.40e-06 ***
+SpeciesP. clivosa     0.3209     0.1276   2.516   0.0119 *  
+Region2              -5.4622     0.5092 -10.727  < 2e-16 ***
+Region3              -5.9203     0.5126 -11.550  < 2e-16 ***
+Region4              -4.2395     0.5098  -8.316  < 2e-16 ***
+Region5              -4.2149     0.5099  -8.267  < 2e-16 ***
+Region6              -3.5127     0.5127  -6.851 7.34e-12 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1

@@ -1,0 +1,34 @@
+ Family: binomial  ( logit )					
+Formula:          Cumulative_Predation ~ Region * STRATA + SourceNursery + (1 |      Region_Site)					
+Data: end_of_study_data_OFAV					
+					
+      AIC       BIC    logLik -2*log(L)  df.resid 					
+    470.8     546.7    -218.4     436.8       627 					
+					
+Random effects:					
+					
+Conditional model:					
+Groups	Name	Variance	Std.Dev.		
+Region_Site	(Intercept)	0.03258	0.1805		
+"Number of obs: 644, groups:  Region_Site, 24"					
+					
+Conditional model:					
+	Estimate	Std. Error	z value	Pr(>|z|)	
+(Intercept)	-3.01E+00	5.70E-01	-5.275	1.33E-07	***
+Region2	24.650	7832	0.003	0.997	
+Region3	5.857	0.921	6.36	2.02E-10	***
+Region4	3.750	0.646	5.808	6.31E-09	***
+Region5	3.217	0.635	5.065	4.09E-07	***
+Region6	2.533	0.626	4.05	5.12E-05	***
+STRATAOffshore	0.925	0.670	1.382	0.167	
+SourceNurseryFWC	0.078	0.608	0.129	0.897	
+SourceNurseryMML	1.050	0.304	3.448	0.000564	***
+SourceNurseryRR	0.386	0.339	1.14	0.254	
+SourceNurseryUM	0.850	0.627	1.354	0.176	
+Region2:STRATAOffshore	4.935	148100	0	1.000	
+Region3:STRATAOffshore	-2.036	1.095	-1.86	0.063	.
+Region4:STRATAOffshore	0.500	0.925	0.541	0.588	
+Region5:STRATAOffshore	1.775	1.047	1.695	0.090	.
+Region6:STRATAOffshore	0.104	0.804	0.13	0.897	
+---					
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1					
