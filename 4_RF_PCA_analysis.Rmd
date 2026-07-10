@@ -1,0 +1,848 @@
+---
+title: "RTT Predation Study - Random Forest and PCA Analysis"
+subtitle: "Variable Importance and Ordination of Predation Predictors"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(randomForest)
+library(plotrix)
+library(cowplot)
+library(ggrepel)
+library(ragg)
+library(FactoMineR)
+library(factoextra)
+library(glmmTMB)
+library(DHARMa)
+
+
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+theme_pnas <- function() {
+  theme_classic() +
+  theme(
+    text         = element_text(size = 8),
+    axis.title   = element_text(size = 8),
+    axis.text    = element_text(size = 8),
+    legend.text  = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    plot.title   = element_text(size = 8, face = "bold"),
+    strip.text   = element_text(size = 8),
+    axis.line    = element_line(linewidth = 0.4),
+    axis.ticks   = element_line(linewidth = 0.4)
+  )
+}
+theme_set(theme_pnas())
+
+species_colors <- c(
+  "M. cavernosa" = "#CC5500",
+  "O. faveolata" = "#5A8754",
+  "P. clivosa"   = "#E1AD01"
+)
+
+```
+
+---
+
+# Load and Prepare Data
+
+```{r load data, include=FALSE}
+outplant_monitoring <- read_xlsx(
+  "Supplementary Table 1 - Coral Outplant and Fish Data.xlsx",
+  sheet = "tidyCoral RT_Outplant_Corrected"
+)
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(Region, Site, DEPTH, STRATA) %>% 
+  distinct()  -> site_characteristics
+
+fish_survey <- read_xlsx(
+  "input_files/Supplementary Table 1 - Coral Outplant and Fish Data.xlsx",
+  sheet = "tidy Fish RT_DETAIL"
+)
+
+DRM_coral <- read_xlsx("input_files/RT_DRM_Colonies_UM.xlsx")
+DRM_all <- read_xlsx("input_files/RT_DRM_General_UM.xlsx", sheet = "RT_DRM_Survey_Edited")
+
+DRM_all %>% 
+  dplyr::select(`Region:`:`Date:`, Rugosity_1:Rugosity_10, `Depth:`, `Habitat:`, `Number of corals`) %>% 
+  rename(Region = `Region:`,
+         Site = `Site:`,
+         Date = `Date:`,
+         Depth_m = `Depth:`,
+         Habitat = `Habitat:`,
+         Num_corals = `Number of corals`) %>% 
+  mutate(Transect = as.double(Transect))%>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach",
+                                 Region == 2 ~ "Broward-Miami",
+                                 Region == 3 ~ "Biscayne",
+                                 Region == 4 ~ "Upper Keys",
+                                 Region == 5 ~ "Middle Keys",
+                                 Region == 6 ~ "Lower Keys")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach", "Broward-Miami", "Biscayne", "Upper Keys", "Middle Keys", "Lower Keys")) -> DRM_general_tidy
+
+DRM_coral %>% 
+  dplyr::select(Region, Site, Transect, Species:Heightcm) -> DRM_coral_tidy
+
+full_join(DRM_general_tidy, DRM_coral_tidy, by = c("Region", "Site", "Transect")) -> DRM_full_tidy
+
+DRM_coral %>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach",
+                                 Region == 2 ~ "Broward-Miami",
+                                 Region == 3 ~ "Biscayne",
+                                 Region == 4 ~ "Upper Keys",
+                                 Region == 5 ~ "Middle Keys",
+                                 Region == 6 ~ "Lower Keys")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach", "Broward-Miami", "Biscayne", "Upper Keys", "Middle Keys", "Lower Keys")) -> DRM_coral
+
+DRM_general_tidy %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> DRM_general_tidy
+
+DRM_coral %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> DRM_coral
+
+# ── Region name helper ────────────────────────────────────────────────────────
+recode_regions <- function(df) {
+  df %>%
+    mutate(Region_name = case_when(
+      Region == 1 ~ "Martin/Palm Beach",
+      Region == 2 ~ "Broward-Miami",
+      Region == 3 ~ "Biscayne",
+      Region == 4 ~ "Upper Keys",
+      Region == 5 ~ "Middle Keys",
+      Region == 6 ~ "Lower Keys"
+    )) %>%
+    mutate(Region_name = fct_relevel(
+      Region_name,
+      "Martin/Palm Beach", "Broward-Miami", "Biscayne",
+      "Upper Keys", "Middle Keys", "Lower Keys"
+    ))
+}
+
+outplant_monitoring <- recode_regions(outplant_monitoring)
+fish_survey         <- recode_regions(fish_survey)
+
+# ── Fish abundances ───────────────────────────────────────────────────────────
+# Per monitoring interval (temporal variation)
+fish_abundances_mi <- fish_survey %>%
+  dplyr::select(Region, Site, MI_CORRECTED, Parrotfish, Butterflyfish) %>%
+  rename(parrotfish_at_mi = Parrotfish, butterflyfish_at_mi = Butterflyfish)
+
+# Site-level means (across all time)
+fish_abundances_site <- fish_survey %>%
+  group_by(Region, Site) %>%
+  summarise(
+    mean_parrotfish    = mean(Parrotfish,    na.rm = TRUE),
+    mean_butterflyfish = mean(Butterflyfish, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Date handling ─────────────────────────────────────────────────────────────
+outplant_fish_dates <- fish_survey %>%
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>%
+  distinct()
+
+outplant_with_dates <- left_join(
+  outplant_monitoring, outplant_fish_dates,
+  by = c("MI_CORRECTED", "Region", "Site")
+)
+
+middle_date_by_MI <- outplant_with_dates %>%
+  dplyr::select(MI_CORRECTED, Date) %>%
+  distinct() %>%
+  arrange(Date) %>%
+  group_by(MI_CORRECTED) %>%
+  slice(ceiling(n() / 2)) %>%
+  drop_na() %>%
+  rename(Middle_MI_date = Date)
+
+outplant_days <- left_join(outplant_with_dates, middle_date_by_MI, by = "MI_CORRECTED") %>%
+  mutate(
+    Date_Monitored = coalesce(Date, Middle_MI_date),
+    Exact_Days     = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06")),
+    Days_MI        = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))
+  )
+
+# ── Predation metrics ─────────────────────────────────────────────────────────
+outplant_tidy <- outplant_days %>%
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>%
+  group_by(Region, Site, ColonyNumber) %>%
+  mutate(
+    Experienced_Predation = ifelse(
+      (FishBites == "yes" | PRED_1 > 0) & Snails == "no", 1, 0
+    ),
+    Cumulative_Predation = ifelse(
+      cumsum(ifelse(Experienced_Predation == 1, 1, 0)) > 0, 1, 0
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Species = case_when(
+      Species == "MCAV" ~ "M. cavernosa",
+      Species == "OFAV" ~ "O. faveolata",
+      Species == "PCLI" ~ "P. clivosa"
+    ),
+    STRATA_num   = ifelse(STRATA == "Offshore", 1, 0),
+    Region       = as.numeric(as.character(Region)),
+    Site         = as.numeric(as.character(Site))
+  )
+
+# ── DRM site metrics ──────────────────────────────────────────────────────────
+# Rugosity: mean across all transects per site
+drm_rugosity <- DRM_general_tidy %>% 
+  pivot_longer(cols = Rugosity_1:Rugosity_10, names_to = "Rugosity_Measurement", values_to = "Rugosity_Value") %>% 
+  group_by(Region_name, Site) %>% 
+  mutate(mean_rugosity = mean(Rugosity_Value), 
+                              std_dev_rugosity = sd(Rugosity_Value),
+         avg_depth = mean(Depth_m),
+          rugosity_range = max(Rugosity_Value) - min(Rugosity_Value)) %>% 
+  dplyr::select(Region_name, Site, STRATA, mean_rugosity, std_dev_rugosity, avg_depth, Habitat, rugosity_range) %>% 
+  distinct()
+
+# Coral density from DRM colony data
+# 4, 1 x 10 m transects = 40m^2 reef area
+#Mean ± SE density (number of colonies/m2)
+
+coral_density_region_strata <-DRM_general_tidy %>% 
+  group_by(Region, STRATA) %>% 
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/80), #80 m2 because 2 sites combined for each strata
+            se_density_per_m2 = sd(Num_corals/80)/sqrt(n()))
+
+coral_density_site <- DRM_general_tidy %>% 
+  group_by(Region_name, Site) %>% 
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/40), # 40m2 because each site
+            se_density_per_m2 = sd(Num_corals/40)/sqrt(n()))
+
+# Coral cover from DRM colony data
+# Coral cover as a percentage of the total area
+# if the total area is 40 m ^2 per site
+# take surface area of the coral - area of a circle using diameter, and then multiply by live tissue area % (add up old + recent mortality, then subtract that from area)
+# area of circle formula = A = 0.25πd^2
+
+coral_cover_site <- DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup()
+
+# ── Build site × MI summary (unit of analysis for RF and nMDS) ───────────────
+# Each row = one coral species at one site at one monitoring interval
+# Predation metrics averaged across colonies
+
+site_mi_summary <- outplant_tidy %>%
+  filter(!(MI_CORRECTED == 2 & Region == 3)) %>%  # remove incomplete MI
+  group_by(Region_name, Region, Site, MI_CORRECTED, Days_MI, STRATA_num, Species) %>%
+  summarise(
+    mean_pred_occurrence = mean(Experienced_Predation, na.rm = TRUE),
+    prop_ever_predated   = mean(Cumulative_Predation,  na.rm = TRUE),
+    mean_intensity       = mean(PRED_1, na.rm = TRUE),
+    n_colonies           = n(),
+    .groups = "drop"
+  ) %>%
+  # Join temporal fish abundances
+  left_join(fish_abundances_mi %>%
+              mutate(Region = as.numeric(Region), Site = as.numeric(Site)),
+            by = c("Region", "Site", "MI_CORRECTED")) %>%
+  # Join site-level fish means
+  left_join(fish_abundances_site %>%
+              mutate(Region = as.numeric(Region), Site = as.numeric(Site)),
+            by = c("Region", "Site")) %>%
+  # Join DRM metrics
+   left_join(drm_rugosity %>%
+              dplyr::select(Region_name, Site,
+                            mean_rugosity, avg_depth, Habitat),
+            by = c("Region_name", "Site")) %>%
+  left_join(coral_density_site %>%
+              dplyr::select(Region_name, Site, mean_density_per_m2),
+            by = c("Region_name", "Site")) %>%
+  left_join(coral_cover_site %>%
+              dplyr::select(Region_name, Site, percent_cover),
+            by = c("Region_name", "Site"))
+
+site_mi_summary %>% 
+  left_join(., site_characteristics, by = c("Region", "Site")) -> site_mi_summary
+```
+
+# Coral density and cover plots
+```{r}
+strata_plot1<-DRM_general_tidy %>% 
+  group_by(Region_name, STRATA) %>% # 2 sites per strata, 40 m^2 per site
+  summarize(total_corals = sum(Num_corals),
+            mean_density_per_m2 = mean(Num_corals/80),
+            se_density_per_m2 = sd(Num_corals/80)/sqrt(n())) %>% 
+  ggplot(., aes(x=STRATA, y=mean_density_per_m2, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_density_per_m2 - se_density_per_m2, ymax=mean_density_per_m2 + se_density_per_m2), width=0.2) +
+  theme_pnas() +
+  labs(y = expression(Coral~density~(colonies / m^2)),
+       x = "Region") +
+  theme(legend.position = "none") +
+  theme(plot.margin = ggplot2::margin(t = 10, r = 10, b = 20, l = 30, unit = "pt")) +
+  facet_wrap(~Region_name, scales = "free")
+
+strata_plot_2<-DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region_name, Site, STRATA) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 40) * 100) %>% 
+  ungroup() %>% 
+  group_by(Region_name, STRATA) %>% 
+  summarise(mean_percent_cover = mean(percent_cover),
+            se_percent_cover = sd(percent_cover)/sqrt(n())) %>%
+  ggplot(., aes(x=STRATA, y=mean_percent_cover, color = Region_name)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=mean_percent_cover - se_percent_cover, ymax=mean_percent_cover + se_percent_cover), width=0.2) +
+    theme_pnas() +
+  theme(legend.position = "none") +
+  labs(y="Coral cover (%)",
+       x = "Region") +
+  theme(plot.margin = ggplot2::margin(t = 10, r = 10, b = 10, l = 30, unit = "pt")) +
+  facet_wrap(~Region_name, scales = "free")
+
+cowplot::plot_grid(strata_plot1, strata_plot_2, ncol = 1, labels = c("A", "B"))
+ggsave("plots/Manuscript Figures/FigS5_coral_density_cover.pdf",
+       width  = 20, height = 17, units = "cm",
+       dpi    = 600)
+```
+### stats
+
+```{r}
+export_glmm <- function(model, name, emmeans_specs) {
+  as.data.frame(car::Anova(model, type = "II")) %>%
+    rownames_to_column("Term") %>%
+    write_csv(paste0("SI_tables/", name, "_anova.csv"))
+  
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    write_csv(paste0("SI_tables/", name, "_fixed_effects.csv"))
+  
+  # emmeans_specs is a named list, e.g. list(strata_within_region = "pairwise ~ STRATA | Region_name", region_within_strata = "pairwise ~ Region_name | STRATA")
+  for (spec_name in names(emmeans_specs)) {
+    em <- emmeans::emmeans(model, as.formula(emmeans_specs[[spec_name]]), adjust = "tukey")
+    as.data.frame(em$contrasts) %>%
+      write_csv(paste0("SI_tables/", name, "_emmeans_", spec_name, ".csv"))
+  }
+  cat("Exported:", name, "\n")
+}
+```
+
+coral density
+```{r}
+# calculate individual coral density for each transect (number of corals per 10 meter transect)
+DRM_general_tidy %>% 
+  dplyr::select(Region, Site, Transect, Num_corals:STRATA) %>% 
+  mutate(density_per_m2 = Num_corals/10) -> DRM_density_stats
+
+density_glm <- glmmTMB(density_per_m2 ~ Region_name * STRATA + (1|Region/Site/Transect), data = DRM_density_stats, family = gaussian)
+
+summary(density_glm)
+
+sim_res_density_glm <- simulateResiduals(density_glm)
+plot(sim_res_density_glm)
+
+car::Anova(density_glm, Type = "II")
+# region, strata, and interaction are significant
+
+emmeans::emmeans(density_glm, pairwise ~ STRATA | Region_name)
+# only monroe county sites are significantly different between inshore and offshore within each region
+
+emmeans::emmeans(density_glm, pairwise ~ Region_name|STRATA)
+# inshore, Martin/Palm beach significantly lower Martin/Palm beach than all other counties (except Broward and Miami Dade)
+
+emm_strata <- emmeans::emmeans(density_glm, pairwise ~ STRATA | Region_name,
+                                adjust = "tukey")
+print(emm_strata$contrasts)
+```
+
+coral cover
+```{r}
+# calculate proportion of total transect area covered by coral 
+DRM_coral %>% 
+  mutate(Area_cm2 = 0.25 * pi * (Widthcm^2),
+         Live_tissue_percent = 100 - (OldMortality + OtherRecentMort + DiseaseRecentMort),
+         Live_tissue_area_cm2 = Area_cm2 * (Live_tissue_percent / 100)) %>% 
+  group_by(Region, Site, Transect) %>% 
+  summarize(total_live_tissue_area_cm2 = sum(Live_tissue_area_cm2, na.rm = TRUE),
+            total_live_tissue_area_m2 = total_live_tissue_area_cm2 / 10000,
+            percent_cover = (total_live_tissue_area_m2 / 10),
+            STRATA = first(STRATA),
+            Region_name = first(Region_name)) -> DRM_cover_stats
+
+coral_cover_glm <- glmmTMB(percent_cover ~ Region_name * STRATA + (1|Region/Site/Transect),
+                 data = DRM_cover_stats,
+                 family = beta_family())
+
+summary(coral_cover_glm)
+sim_res_coral_cover_glm <- simulateResiduals(coral_cover_glm)
+plot(sim_res_coral_cover_glm)
+
+car::Anova(coral_cover_glm, Type = "II")
+
+emmeans::emmeans(coral_cover_glm, pairwise ~ STRATA | Region_name)
+# only monroe county sites are significantly different between inshore and offshore within each region
+
+emmeans::emmeans(coral_cover_glm, pairwise ~ Region_name|STRATA)
+
+export_glmm(density_glm, "density",
+            list(strata_within_region = "pairwise ~ STRATA | Region_name",
+                 region_within_strata = "pairwise ~ Region_name | STRATA"))
+
+export_glmm(coral_cover_glm, "coral_cover",
+            list(strata_within_region = "pairwise ~ STRATA | Region_name",
+                 region_within_strata = "pairwise ~ Region_name | STRATA"))
+```
+
+```{r}
+vars <- c("mean_rugosity", "percent_cover", "mean_density_per_m2")
+fish <- c("mean_parrotfish", "mean_butterflyfish")
+
+site_data <- site_mi_summary %>%
+  filter(MI_CORRECTED == 25) %>%
+  group_by(Region, Region_name, Site, STRATA, STRATA_num,
+           mean_parrotfish, mean_butterflyfish,
+           avg_depth, mean_rugosity,
+           mean_density_per_m2, percent_cover) %>%
+  summarise(
+    prop_ever_predated = mean(prop_ever_predated, na.rm = TRUE),
+    mean_intensity     = mean(mean_intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cor_results <- expand_grid(site_var = vars, fish_var = fish) %>%
+  mutate(
+    test = map2(site_var, fish_var, ~ cor.test(site_data[[.x]], site_data[[.y]], method = "spearman")),
+    rho  = map_dbl(test, ~ .x$estimate),
+    p    = map_dbl(test, ~ .x$p.value)
+  ) %>%
+  select(site_var, fish_var, rho, p)
+
+print(cor_results)
+
+write_csv(cor_results, "SI_tables/rugosity_cover_density_fish_correlations.csv")
+```
+
+```{r}
+site_vars <- c("mean_rugosity", "percent_cover", "mean_density_per_m2")
+fish_vars <- c("mean_parrotfish", "mean_butterflyfish")
+
+var_labels <- c(
+  mean_rugosity = "Mean rugosity",
+  percent_cover = "Mean coral cover (%)",
+  mean_density_per_m2 = "Mean coral density (colonies/m²)",
+  mean_parrotfish = "Mean parrotfish abundance",
+  mean_butterflyfish = "Mean butterflyfish abundance"
+)
+
+plot_data <- expand_grid(site_var = site_vars, fish_var = fish_vars) %>%
+  mutate(
+    test = map2(site_var, fish_var, ~ cor.test(site_data[[.x]], site_data[[.y]],
+                                                 method = "spearman", exact = FALSE)),
+    rho  = map_dbl(test, ~ .x$estimate),
+    p    = map_dbl(test, ~ .x$p.value),
+    label = sprintf("Spearman R = %.2f, p = %s", rho,
+                     ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p)))
+  )
+
+make_panel <- function(site_var, fish_var, label, show_legend = FALSE) {
+  d <- site_data
+  x_range <- range(d[[site_var]], na.rm = TRUE)
+  y_range <- range(d[[fish_var]], na.rm = TRUE)
+
+  p <- ggplot(d, aes(x = .data[[site_var]], y = .data[[fish_var]])) +
+    geom_point(aes(color = Region_name), size = 2.5, alpha = 0.9) +
+    geom_smooth(method = "lm", se = FALSE, linetype = "dashed",
+                color = "grey40", linewidth = 0.5) +
+    annotate("text",
+             x = x_range[2], y = y_range[1],
+             hjust = 1, vjust = 0,
+             label = label, size = 2.8, fontface = "italic") +
+    labs(x = var_labels[[site_var]], y = var_labels[[fish_var]], color = "Region") +
+    theme_pnas() +
+    theme(legend.position = if (show_legend) "right" else "none")
+  p
+}
+
+panels <- plot_data %>%
+  mutate(plot = pmap(list(site_var, fish_var, label), make_panel))
+
+legend_plot <- make_panel(plot_data$site_var[1], plot_data$fish_var[1],
+                           plot_data$label[1], show_legend = TRUE) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.box = "horizontal")
+legend <- get_legend(legend_plot)
+
+grid <- plot_grid(plotlist = panels$plot, ncol = 2, nrow = 3,
+                   labels = "AUTO", label_size = 10)
+
+# stack grid on top, legend below, horizontal row
+final_fig <- plot_grid(grid, legend, ncol = 1, rel_heights = c(1, 0.08))
+
+ggsave("plots/Manuscript Figures/FigS6_rugosity_cover_density_fish_corr.pdf",
+       plot = final_fig, width = 17.4, height = 22, units = "cm",
+       dpi = 600)
+```
+
+
+
+
+# Random Forest: Variable Importance for Cumulative Predation Prevalence
+```{r}
+# Primary RF — cumulative predation prevalence
+rf_data <- site_mi_summary %>%
+  dplyr::select(
+    prop_ever_predated,    # response — cumulative prevalence at site x MI
+    Region, STRATA, MI_CORRECTED,
+    mean_parrotfish, mean_butterflyfish,
+    avg_depth, mean_rugosity,
+    mean_density_per_m2, percent_cover
+  ) %>%
+  mutate(Region = as.factor(Region),
+         STRATA = as.factor(STRATA)) %>% 
+  na.omit() # lose 12 rows from when parrotfish and butterflyfish surveys were skipped- ok
+
+# Train/test split
+set.seed(123)
+train_idx <- sample(nrow(rf_data), nrow(rf_data) * 0.75)
+
+rf_train <- rf_data[train_idx, ]
+rf_test  <- rf_data[-train_idx, ]
+
+cat("Total observations (rf_data):", nrow(rf_data), "\n")
+cat("Training set:", nrow(rf_train), "\n")
+cat("Test set:", nrow(rf_test), "\n")
+```
+
+```{r rf regression cumulative predation prevalence}
+rf_cumulative <- randomForest(
+  prop_ever_predated ~ .,
+  data       = rf_train,
+  ntree      = 1000,
+  importance = TRUE,
+  mtry       = floor(sqrt(ncol(rf_train) - 1))
+)
+
+print(rf_cumulative)
+
+# Out-of-bag error
+cat("OOB R-squared:", round(1 - rf_cumulative$mse[1000] / var(rf_train$prop_ever_predated), 3), "\n")
+
+# Test set performance
+pred_test <- predict(rf_cumulative, newdata = rf_test)
+ss_res  <- sum((rf_test$prop_ever_predated - pred_test)^2)
+ss_tot  <- sum((rf_test$prop_ever_predated - mean(rf_test$prop_ever_predated))^2)
+cat("Test R-squared:", round(1 - ss_res / ss_tot, 3), "\n")
+```
+
+
+```{r}
+importance_df <- as.data.frame(importance(rf_cumulative)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(`%IncMSE`) %>%
+  mutate(Variable = factor(Variable, levels = Variable))
+
+print(importance_df)
+```
+
+
+```{r}
+importance_df <- importance_df %>%
+  mutate(
+    Variable_label = case_match(
+      as.character(Variable),
+      "Region"               ~ "Region",
+      "STRATA"               ~ "Strata",
+      "MI_CORRECTED"         ~ "Monitoring interval",
+      "mean_parrotfish"      ~ "Mean parrotfish (site)",
+      "mean_butterflyfish"   ~ "Mean butterflyfish (site)",
+      "avg_depth"            ~ "Depth (site)",
+      "mean_rugosity"        ~ "Rugosity (site)",
+      "mean_density_per_m2"  ~ "Coral density (colonies/m²) (site)",
+      "percent_cover"        ~ "Coral cover (%) (site)",
+      .default = as.character(Variable)
+    ),
+    Variable_label = factor(Variable_label, levels = Variable_label)
+  )
+
+p_rf <- ggplot(importance_df, aes(x = `%IncMSE`, y = Variable_label)) +
+  geom_col(fill = "#4a90d9") +
+  geom_vline(xintercept = 0, linewidth = 0.3, color = "grey40") +
+  labs(x = "% Increase in MSE", y = NULL) +
+  theme_pnas()
+
+ggsave("plots/Manuscript Figures/FigRF_variable_importance.tiff",
+       plot   = p_rf,
+       width  = 8.7, height = 8, units = "cm",
+       dpi    = 600, compression = "lzw",
+       device = ragg::agg_tiff)
+```
+
+
+## comparing mean fish abundane vs fish abundance at every mi
+```{r}
+# Version 1: temporal fish
+rf_data_v1 <- site_mi_summary %>%
+  dplyr::select(
+    prop_ever_predated,
+    Region, STRATA, MI_CORRECTED,
+    parrotfish_at_mi, butterflyfish_at_mi,
+    avg_depth, mean_rugosity,
+    mean_density_per_m2, percent_cover
+  ) %>%
+  mutate(Region = as.factor(Region),
+         STRATA = as.factor(STRATA)) %>%
+  na.omit()
+
+# Version 2: site-level fish means
+rf_data_v2 <- site_mi_summary %>%
+  dplyr::select(
+    prop_ever_predated,
+    Region, STRATA, MI_CORRECTED,
+    mean_parrotfish, mean_butterflyfish,
+    avg_depth, mean_rugosity,
+    mean_density_per_m2, percent_cover
+  ) %>%
+  mutate(Region = as.factor(Region),
+         STRATA = as.factor(STRATA)) %>%
+  na.omit()
+
+set.seed(123)
+rf_v1 <- randomForest(prop_ever_predated ~ ., data = rf_data_v1,
+                      ntree = 1000, importance = TRUE)
+rf_v2 <- randomForest(prop_ever_predated ~ ., data = rf_data_v2,
+                      ntree = 1000, importance = TRUE)
+
+cat("V1 (temporal fish) % Var explained:", rf_v1$rsq[1000] * 100, "\n")
+cat("V2 (site mean fish) % Var explained:", rf_v2$rsq[1000] * 100, "\n")
+
+print(importance(rf_v1))
+print(importance(rf_v2))
+
+# site mean is better -- 87% of variance explained, mean fish abundances rank higher
+```
+
+
+# Random Forest: Variable Importance for Predation Intensity
+
+```{r rf data prep}
+rf_intensity <- site_mi_summary %>%
+  dplyr::select(
+    mean_intensity,       # response
+    Region, STRATA, MI_CORRECTED,
+    parrotfish_at_mi, butterflyfish_at_mi,
+    mean_parrotfish, mean_butterflyfish,
+    avg_depth, mean_rugosity,
+    mean_density_per_m2, percent_cover,
+    n_colonies
+  ) %>%
+  mutate(
+    Region     = as.factor(Region),
+    STRATA = as.factor(STRATA)
+  ) %>%
+  na.omit()
+
+# Train/test split
+set.seed(123)
+train_idx <- sample(nrow(rf_intensity), nrow(rf_intensity) * 0.75)
+
+rf_train <- rf_intensity[train_idx, ]
+rf_test  <- rf_intensity[-train_idx, ]
+```
+
+```{r rf regression predation intensity}
+
+rf_intensity <- randomForest(
+  mean_intensity ~ .,
+  data       = rf_train,
+  ntree      = 1000,
+  importance = TRUE,
+  mtry       = floor(sqrt(ncol(rf_train) - 1))
+)
+
+print(rf_intensity)
+
+# Out-of-bag error
+cat("OOB R-squared:", round(1 - rf_intensity$mse[1000] / var(rf_train$mean_intensity), 3), "\n")
+
+# Test set performance
+pred_test <- predict(rf_intensity, newdata = rf_test)
+ss_res  <- sum((rf_test$mean_intensity - pred_test)^2)
+ss_tot  <- sum((rf_test$mean_intensity - mean(rf_test$mean_intensity))^2)
+cat("Test R-squared:", round(1 - ss_res / ss_tot, 3), "\n")
+```
+
+```{r rf variable importance plot}
+# Extract importance
+importance_df <- as.data.frame(importance(rf_intensity)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(`%IncMSE`) %>%
+  mutate(Variable = factor(Variable, levels = Variable))
+
+p_rf_intensity <- ggplot(importance_df,
+                          aes(x = `%IncMSE`, y = Variable)) +
+  geom_col(fill = "#4a90d9") +
+  labs(x = "% Increase in MSE", y = NULL,
+       title = "Predation intensity") +
+  theme_pnas()
+
+print(p_rf_intensity)
+```
+
+
+---
+
+# PCA
+```{r}
+# Site-level predictor matrix — one row per site
+pca_meta <- site_mi_summary %>%
+  filter(MI_CORRECTED == 25) %>%
+  group_by(Region, Region_name, Site, STRATA, STRATA_num,
+           mean_parrotfish, mean_butterflyfish,
+           avg_depth, mean_rugosity,
+           mean_density_per_m2, percent_cover) %>%
+  summarise(
+    prop_ever_predated = mean(prop_ever_predated, na.rm = TRUE),
+    mean_intensity     = mean(mean_intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pca_data <- pca_meta %>%
+  dplyr::select(
+    mean_parrotfish, mean_butterflyfish,
+    avg_depth, mean_rugosity,
+    mean_density_per_m2, percent_cover
+  ) %>%
+  scale() %>%
+  as.data.frame()
+
+# Run PCA
+pca_result <- prcomp(pca_data, center = FALSE, scale. = FALSE)  # already scaled
+summary(pca_result)
+summary(pca_result)$importance[2, 1:4] * 100
+
+# Verify row count matches PCA
+nrow(pca_meta) == nrow(pca_result$x)
+
+# Extract scores and join metadata
+pca_scores <- as.data.frame(pca_result$x[, 1:2]) %>%
+  bind_cols(pca_meta %>%
+              dplyr::select(Region_name, STRATA, Site,
+                            prop_ever_predated, mean_intensity))
+
+# How much variance do PC1 and PC2 explain?
+pca_var <- summary(pca_result)$importance[2, 1:2] * 100
+cat("PC1:", round(pca_var[1], 1), "% PC2:", round(pca_var[2], 1), "%\n")
+
+# Raw loadings, all PCs
+pca_result$rotation
+
+# Just PC1 and PC2, sorted by absolute contribution to PC1
+loadings_df <- as.data.frame(pca_result$rotation[, 1:2]) |>
+  tibble::rownames_to_column("variable") |>
+  dplyr::mutate(
+    abs_PC1 = abs(PC1),
+    abs_PC2 = abs(PC2)
+  ) |>
+  dplyr::arrange(dplyr::desc(abs_PC1))
+
+print(loadings_df)
+
+contrib <- as.data.frame(pca_result$rotation^2) |>
+  tibble::rownames_to_column("variable") |>
+  dplyr::mutate(dplyr::across(-variable, ~ .x / sum(.x) * 100))
+
+print(contrib)
+
+# Add loading vectors to show which variables drive each axis
+pca_loadings <- as.data.frame(pca_result$rotation[, 1:2]) %>%
+  rownames_to_column("Variable") %>%
+  mutate(Variable = case_match(
+    Variable,
+    "mean_parrotfish"      ~ "Parrotfish",
+    "mean_butterflyfish"   ~ "Butterflyfish",
+    "avg_depth"            ~ "Depth",
+    "mean_rugosity"        ~ "Rugosity",
+    "mean_density_per_m2"  ~ "Coral density",
+    "percent_cover"        ~ "Coral cover"
+  ))
+
+arrow_scale <- 3 
+
+p_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Region_name, size = prop_ever_predated), alpha = 0.8) +
+  geom_segment(data = pca_loadings,
+               aes(x = 0, y = 0,
+                   xend = PC1 * arrow_scale,
+                   yend = PC2 * arrow_scale),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "grey30", linewidth = 0.5,
+               inherit.aes = FALSE) +
+  geom_text_repel(data = pca_loadings,
+                  aes(x = PC1 * arrow_scale * 1.2,
+                      y = PC2 * arrow_scale * 1.2,
+                      label = Variable),
+                  size = 3, color = "grey30",
+                  inherit.aes = FALSE) +
+  scale_size_continuous(range = c(1, 5),
+                        labels = scales::percent_format(),
+                        name = "Cumulative\npredation\nprevalence") +
+  labs(x = paste0("PC1 (", round(pca_var[1], 1), "% variance)"),
+       y = paste0("PC2 (", round(pca_var[2], 1), "% variance)"),
+       color = NULL, fill = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 3)),
+         fill = "none") +
+  theme_pnas()
+
+print(p_pca)
+
+ggsave("plots/Manuscript Figures/FigPCA_site_characteristics.tiff",
+       plot   = p_pca,
+       width  = 8.7, height = 8, units = "cm",
+       dpi    = 600, compression = "lzw",
+       device = ragg::agg_tiff)
+
+```
+
+export PCA
+```{r}
+as.data.frame(pca_result$rotation[, 1:6]) %>%
+  rownames_to_column("Variable") %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  write_csv("SI_tables/PCA_loadings.csv")
+
+as.data.frame(summary(pca_result)$importance) %>%
+  rownames_to_column("Metric") %>%
+  write_csv("SI_tables/PCA_variance_explained.csv")
+```
+
+
+
+combined plots
+```{r}
+plot_grid(p_rf, p_pca, ncol = 2, labels = c("A", "B"), rel_widths = c(1, 1.5))
+ggsave("plots/Manuscript Figures/Fig5.pdf",
+       width  = 8, height = 4,
+       dpi    = 600)
+```
+

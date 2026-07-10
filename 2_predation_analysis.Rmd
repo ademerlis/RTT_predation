@@ -1,0 +1,1363 @@
+---
+title: "RTT Predation Study"
+subtitle: "Predation Prevalence, Intensity, Index, and Fish Correlations"
+author: "Allyson DeMerlis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load libraries and data
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(plotrix)
+library(lme4)
+library(multcomp)
+library(car)
+library(survival)
+library(cowplot)
+library(ggpubr)
+library(survminer)
+library(coxme)
+library(ggsurvfit)
+library(MuMIn)       # for AICc model comparison
+library(DHARMa)      # residual diagnostics
+library(pROC)        # AUC
+library(DescTools)   # Brier score
+library(broom.mixed) # tidy summaries for mixed models
+library(emmeans)   # post-hoc comparisons
+library(glmmTMB)
+library(ggeffects)
+library(ggpmisc)
+
+# Ensure the working directory is set to the project folder
+i_am("Analysis_AllysonDeMerlis.Rproj")
+opts_knit$set(root.dir = here())
+
+theme_pnas <- function() {
+  theme_classic() +
+  theme(
+    text         = element_text(size = 8),
+    axis.title   = element_text(size = 8),
+    axis.text    = element_text(size = 8),
+    legend.text  = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    plot.title   = element_text(size = 8, face = "bold"),
+    strip.text   = element_text(size = 8),
+    axis.line    = element_line(linewidth = 0.4),
+    axis.ticks   = element_line(linewidth = 0.4)
+  )
+}
+
+theme_set(theme_pnas())
+
+# Color palettes
+species_colors <- c(
+  "M. cavernosa" = "#CC5500",  # Burnt orange
+  "P. clivosa" = "#E1AD01",  # Mustard yellow
+  "O. faveolata" = "#5A8754"   # Forest green
+)
+
+source_nursery_colors <- c(
+  "UM" = "#1B4D3E",  # Dark forest green
+  "MML" = "#00B4D8",   # Bright cyan blue
+  "CRF" = "#E76F51",  # Coral/burnt orange
+  "RR" = "#6A4C93",   # Deep purple
+  "FWC" = "#F4A261"   # Golden sand
+)
+```
+
+# Stats export function
+```{r setup SI export}
+dir.create("SI_tables", showWarnings = FALSE)
+
+# Helper: exports Anova table, fixed effects, and emmeans contrasts for a model
+export_glmm <- function(model, name, emmeans_spec) {
+  as.data.frame(Anova(model, type = "II")) %>%
+    rownames_to_column("Term") %>%
+    write_csv(paste0("SI_tables/", name, "_anova.csv"))
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    write_csv(paste0("SI_tables/", name, "_fixed_effects.csv"))
+  em <- emmeans(model, as.formula(emmeans_spec), adjust = "tukey")
+  as.data.frame(em$contrasts) %>%
+    write_csv(paste0("SI_tables/", name, "_emmeans.csv"))
+  cat("Exported:", name, "\n")
+}
+```
+
+
+# Tidy data
+
+```{r read in tidied data files, include = FALSE, warning=FALSE, message=FALSE}
+outplant_monitoring <- read_xlsx("input_files/Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidyCoral RT_Outplant_Corrected")
+
+fish_survey <- read_xlsx("input_files/Supplementary Table 1 - Coral Outplant and Fish Data.xlsx", sheet = "tidy Fish RT_DETAIL")
+
+# Apply new region naming convention
+outplant_monitoring %>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach",
+                                 Region == 2 ~ "Broward-Miami",
+                                 Region == 3 ~ "Biscayne",
+                                 Region == 4 ~ "Upper Keys",
+                                 Region == 5 ~ "Middle Keys",
+                                 Region == 6 ~ "Lower Keys")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach", "Broward-Miami", "Biscayne", "Upper Keys", "Middle Keys", "Lower Keys")) -> outplant_monitoring
+
+fish_survey %>% 
+  mutate(Region_name = case_when(Region == 1 ~ "Martin/Palm Beach",
+                                 Region == 2 ~ "Broward-Miami",
+                                 Region == 3 ~ "Biscayne",
+                                 Region == 4 ~ "Upper Keys",
+                                 Region == 5 ~ "Middle Keys",
+                                 Region == 6 ~ "Lower Keys")) %>%
+  mutate(Region_name = fct_relevel(Region_name, "Martin/Palm Beach", "Broward-Miami", "Biscayne", "Upper Keys", "Middle Keys", "Lower Keys")) -> fish_survey
+
+# get actual monitoring dates for corals from the fish survey data frame
+
+fish_survey %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, Date) %>% 
+  distinct() -> outplant_fish_monitoring_dates
+
+str(fish_survey)
+
+# adding exact monitoring dates from fish survey
+left_join(outplant_monitoring, outplant_fish_monitoring_dates, by = c("MI_CORRECTED", "Region", "Site")) -> outplant_monitoring_with_dates
+
+outplant_monitoring_with_dates %>% 
+  filter(is.na(Date)) # MI_CORRECTED 21, region 2 is missing a date -- there were no fish surveys done for this MI
+
+# adding site characteristics (depth, strata)
+outplant_monitoring %>% 
+  dplyr::select(MI_CORRECTED, Region, Site, DEPTH, STRATA) %>% 
+  distinct() %>% 
+  mutate(Region = as.factor(Region)) -> site_characteristics
+
+# Tidying dates for survey time points
+
+# Definitions:
+# SURVEY_MONTH which just means the month the monitoring was done (not accurate dates)
+# Date = exact survey date from fish survey data
+# Middle_MI_date = middle date for each MI across all regions
+
+# all corals were outplanted on May 4-6 2021. 
+# first monitoring for all regions was May 12 or 13, 2021.
+
+# for subsequent MI dates, to ensure that every survey groups together on the same time point (when looking at proportions of total outplants across regions) - pick the middle date for each MI across all regions.
+
+outplant_monitoring_with_dates %>% 
+  dplyr::select(MI_CORRECTED, Date) %>% 
+  distinct() %>% 
+  arrange(Date) %>% 
+  group_by(MI_CORRECTED) %>% 
+  slice(ceiling(n()/2)) %>% 
+  drop_na() %>% 
+  rename(Middle_MI_date = Date) -> middle_date_by_MI
+
+# there will be two types of days calculated - days based on monitoring interval middle date, and exact number of days based on the survey date (from the fish survey data). For any statistical tests using time, use the exact days. Monitoring interval will be reserved for grouping over time, or for visualizations.
+
+left_join(outplant_monitoring_with_dates, middle_date_by_MI, by = c("MI_CORRECTED")) %>% 
+  # use Date if it exists, otherwise Middle_MI_date
+  mutate(Date_Monitored = coalesce(Date, Middle_MI_date)) %>%
+  mutate(Exact_Days = as.numeric(as.Date(Date_Monitored) - as.Date("2021-05-06"))) %>% 
+  mutate(Days_MI = as.numeric(as.Date(Middle_MI_date) - as.Date("2021-05-06"))) -> outplant_monitoring_days_survival
+
+# create a column for "experienced predation" - fish bites was Yes and/or % live tissue area due to predation is > 0. Snails = no
+# Then make a column for cumulative predation - once it experienced predation, it gets a yes and then stays yes.
+# To account for multiple bites, use cumulative predation where it counts the total number of predation events - so experienced predation as "yes" converted to a number by the end of the data set
+
+# important to remove snails = yes when incorporating the PRED_1 > 0 filter, because predation % tissue area could be due to the snails. I'm specifically interested in the fish predation in this study, because we don't have a good count or assessment of snail abundance on the reefs where these corals were outplanted.
+
+outplant_monitoring_days_survival %>% 
+  arrange(Region, Site, ColonyNumber, MI_CORRECTED) %>% 
+  group_by(Region, Site, ColonyNumber) %>% 
+  mutate(Experienced_Predation = ifelse((FishBites == "yes" | PRED_1 > 0) & Snails == "no", "1", "0")) %>% 
+  mutate(Cumulative_Predation = ifelse(cumsum(ifelse(Experienced_Predation == "1", 1, 0)) > 0, "1", "0")) %>% 
+  mutate(Total_Predation_Events = cumsum(ifelse(Experienced_Predation == "1", 1, 0))) %>% 
+  ungroup() %>% 
+  mutate(Species = case_when(Species == "MCAV" ~ "M. cavernosa",
+                             Species == "OFAV" ~ "O. faveolata",
+                             Species == "PCLI" ~ "P. clivosa")) %>% 
+  mutate(Survival = case_when(STATUS_2 == "alive" ~ 1,
+                              STATUS_2 %in% c("dead", "dead_m") ~ 0)) %>% # combine dead and dead_m (missing presumed dead)
+  # note that any "missing" corals will now be NA in Survival column
+  mutate(Species = as.factor(Species),
+         MI_CORRECTED = as.numeric(MI_CORRECTED),
+         Region = as.factor(Region),
+         Site = as.factor(Site),
+         SourceNursery = as.factor(SourceNursery),
+         STRATA = as.factor(STRATA),
+         GenotypeName_Allyson = as.factor(GenotypeName_Allyson),
+         ColonyNumber = as.factor(ColonyNumber),
+         Experienced_Predation = as.factor(Experienced_Predation),
+         Cumulative_Predation = as.factor(Cumulative_Predation)) %>% 
+  filter(!(STATUS_2 == "dead" & (Snails == "yes" | FishBites == "yes" | PRED_1 > 0))) -> outplant_monitoring_days_survival_glm
+# filtering out the 6 instances where a coral is dead but fish bites, snails, or tissue area due to predation are recorded
+
+outplant_monitoring_days_survival_glm %>% 
+  group_by(Snails) %>% 
+  summarise(count = n()) # snails as yes in only 931 / 27174 total surveys = 3.4%
+
+# save outplant_monitoring_days_survival_glm
+#write_csv(outplant_monitoring_days_survival_glm, "tidy_outplant_monitoring_days_survival_glm.csv")
+```
+
+
+# Figure 2: Cumulative Predation Prevalence Over Time
+
+Response variables to test:
+- alive vs. dead (binary)
+- predation prevalence (binary - fish bites + % live tissue due to predation > 0)
+- time to mortality (binary)
+- proportion of live tissue (bounded 0-1)
+- number of predation events (count)
+
+Predictor variables to test:
+- Region (categorical)
+- Site (categorical)
+- Strata (categorical)
+- Genotype (categorical)
+- Species (categorical)
+- Time point (could be continuous or categorical - depending on which column you use)
+- Fish abundance (counts)
+
+## Proportion of predation
+```{r}
+# all corals combined
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>%
+  group_by(Cumulative_Predation) %>%
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = Cumulative_Predation, values_from = count, values_fill = 0) %>% 
+  mutate(total = `0` + `1`,
+         prop_predation = `1`/total)
+
+# species
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>%
+  group_by(Species, Cumulative_Predation) %>%
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = Cumulative_Predation, values_from = count, values_fill = 0) %>% 
+  mutate(total = `0` + `1`,
+         prop_predation = `1`/total)
+
+# species x region
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>%
+  group_by(Species, Region_name, Cumulative_Predation) %>%
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = Cumulative_Predation, values_from = count, values_fill = 0) %>% 
+  mutate(total = `0` + `1`,
+         prop_predation = `1`/total)
+```
+
+## Snail predation 
+```{r}
+outplant_monitoring_days_survival_glm %>% 
+  group_by(Species, Region_name, Snails, MI_CORRECTED, Site) %>% 
+  summarise(count = n() )%>% 
+  pivot_wider(names_from = Snails, values_from = count, values_fill = 0) %>% 
+  ggplot(., aes(x=MI_CORRECTED, y=`yes`/(`yes`+`no`), color=Species)) +
+  geom_point() +
+  facet_wrap(~Region_name+Site) +
+  geom_smooth(se=F) +
+  ylim(0, 1)
+# higher counts of snails at later time points - are those on alive corals or dead corals?
+
+outplant_monitoring_days_survival_glm %>% 
+  group_by(Species, Region_name, STATUS_2, Snails, MI_CORRECTED, Site) %>% 
+  summarise(count = n())%>% 
+  pivot_wider(names_from = Snails, values_from = count, values_fill = 0) %>% 
+  ggplot(., aes(x=MI_CORRECTED, y=`yes`/(`yes`+`no`), color=STATUS_2)) +
+  geom_point() +
+  facet_wrap(~Region_name+Species) 
+# they are indeed on alive corals
+
+# what does predation intensity look like on just alive corals and PRED_1 > 0
+outplant_monitoring_days_survival_glm %>% 
+  filter(PRED_1 > 0 & STATUS_2 == "alive") %>%
+  group_by(Species, Region_name, MI_CORRECTED) %>%
+  ggplot(., aes(x=MI_CORRECTED, y=PRED_1, color=Species)) +
+  geom_point() +
+  facet_wrap(~Region_name) 
+
+# it doesn't look like snail presence correlates with % tissue removed at all
+
+p_snails <- outplant_monitoring_days_survival_glm %>%
+  group_by(Species, Region_name, Snails, Days_MI, Site) %>% 
+  summarise(count = n())%>% 
+  pivot_wider(names_from = Snails, values_from = count, values_fill = 0) %>% 
+  ggplot(., aes(x=Days_MI, y=`yes`/(`yes`+`no`), color=Species)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "loess", se=F, linewidth = 0.3) +
+  facet_wrap(~Region_name) +
+  scale_color_manual(values = species_colors) +
+  theme_pnas() +
+  ylab("Proportion with Snails") +
+  xlab("Days Since Outplanting") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic")
+  ) +
+  ylim(0,1)
+
+# ggsave("plots/proportion_corals_snails_by_region_species.tiff", plot = p_snails,
+#        width = 17.8, height = 8, units = "cm",
+#        dpi = 600, compression = "lzw")
+```
+
+
+
+## Cumulative Predation over time
+```{r}
+## Data prep
+all_days <- sort(unique(outplant_monitoring_days_survival_glm$Days_MI))
+
+# Fixed denominators
+total_by_species <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+total_by_species_region <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species, Region_name) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+total_by_species_strata <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species, STRATA) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+total_by_species_nursery <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species, SourceNursery) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+# Gap-filled cumulative predation (colony x all Days_MI)
+cumulative_filled <- outplant_monitoring_days_survival_glm %>%
+  filter(!(MI_CORRECTED == 2 & Region == 3)) %>%  # two sites missing data at this time point
+  distinct(ColonyNumber, Species, Region_name, STRATA, SourceNursery, Site) %>%
+  crossing(Days_MI = all_days) %>%
+  left_join(
+    outplant_monitoring_days_survival_glm %>%
+      filter(!(MI_CORRECTED == 2 & Region == 3)) %>%
+      dplyr::select(ColonyNumber, Days_MI, Cumulative_Predation, MI_CORRECTED),
+    by = c("ColonyNumber", "Days_MI")
+  ) %>%
+  arrange(ColonyNumber, Days_MI) %>%
+  group_by(ColonyNumber) %>%
+  fill(Cumulative_Predation, .direction = "down") %>%
+  mutate(Cumulative_Predation = replace_na(as.character(Cumulative_Predation), "0")) %>%
+  ungroup()
+
+# Helper to add origin row (0, 0) for smooth to anchor at zero
+add_origin <- function(df, group_vars) {
+  origin <- df %>%
+    distinct(across(all_of(group_vars))) %>%
+    mutate(Days_MI = 0, cumulative_proportion = 0)
+  bind_rows(df, origin)
+}
+
+p0 <- outplant_monitoring_days_survival_glm %>% 
+  mutate(Experienced_Predation = as.double(as.character(Experienced_Predation))) %>% 
+  group_by(Days_MI, Species) %>% 
+  summarise(sum_predation_events = sum(Experienced_Predation), count = n()) %>% 
+  ggplot(., aes(x=Days_MI, y=sum_predation_events, fill=Species)) +
+  geom_bar(stat = "identity", width = 10) +
+  theme_pnas() +
+  ylab("Total Number of Predation Events") +
+  xlab("Days post-outplanting") +
+  theme(legend.text = element_text(face = "italic")) +
+  scale_fill_manual(values = species_colors) +
+  scale_x_continuous(breaks=seq(0, 800, 200)) +
+  expand_limits(y = 0)
+
+## p1: Species 
+p1_data <- cumulative_filled %>%
+  group_by(Species, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species, by = "Species") %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin("Species")
+
+p1 <- ggplot(p1_data, aes(x = Days_MI, y = cumulative_proportion, color = Species)) +
+  geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  scale_color_manual(values = species_colors,
+                     labels = expression(italic("M. cavernosa"),
+                                         italic("O. faveolata"),
+                                         italic("P. clivosa"))) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence",
+       color = NULL) +
+  theme_pnas()
+
+## p2: Region 
+p2_data <- cumulative_filled %>% 
+  group_by(Species, Region_name, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species_region, by = c("Species", "Region_name")) %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin(c("Species", "Region_name"))
+
+p2 <- ggplot(p2_data, aes(x = Days_MI, y = cumulative_proportion, color = Species)) +
+  geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(-0.05, 1.05),
+                   labels = scales::percent_format(),
+                   breaks = c(0, 0.25, 0.5, 0.75, 1.0)) +
+  scale_color_manual(values = species_colors,
+                     labels = expression(italic("M. cavernosa"),
+                                         italic("O. faveolata"),
+                                         italic("P. clivosa"))) +
+  facet_wrap(~Region_name, ncol = 3) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence",
+       color = NULL) +
+  theme_pnas() +
+  theme(legend.text = element_text(face = "italic"))
+
+## p3: Strata
+p3_data <- cumulative_filled %>%
+  group_by(Species, STRATA, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species_strata, by = c("Species", "STRATA")) %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin(c("Species", "STRATA"))
+
+p3 <- ggplot(p3_data, aes(x = Days_MI, y = cumulative_proportion, color = Species)) +
+  geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(-0.05, 1.05),
+                   labels = scales::percent_format(),
+                   breaks = c(0, 0.25, 0.5, 0.75, 1.0)) + 
+  scale_color_manual(values = species_colors,
+                     labels = expression(italic("M. cavernosa"),
+                                         italic("O. faveolata"),
+                                         italic("P. clivosa"))) +
+  facet_wrap(~STRATA) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence",
+       color = NULL) +
+  theme_pnas() +
+  theme(legend.text = element_text(face = "italic"))
+
+## p4: Source nursery 
+p4_data <- cumulative_filled %>%
+  group_by(Species, SourceNursery, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species_nursery, by = c("Species", "SourceNursery")) %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin(c("Species", "SourceNursery"))
+
+p4 <- ggplot(p4_data, aes(x = Days_MI, y = cumulative_proportion, color = SourceNursery)) +
+ geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(-0.05, 1.05),
+                   labels = scales::percent_format(),
+                   breaks = c(0, 0.25, 0.5, 0.75, 1.0)) +
+  scale_color_manual(values = source_nursery_colors) +
+  facet_wrap(~Species) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence",
+       color = "Source Nursery") +
+  theme_pnas() +
+  theme(strip.text = element_text(face = "italic"))
+```
+
+### Combined Plot
+```{r}
+margin_fix <- margin(t=4, r=4, b=4, l=16, unit="pt")
+
+row1 <- plot_grid(
+  p0 + theme(legend.position = "none", 
+             plot.margin = margin_fix) +
+       labs(title = " "),  # blank title adds matching height space
+  p1 + theme(legend.position = "none", 
+             plot.margin = margin_fix) +
+       labs(title = " "),
+  p3 + theme(legend.position = "none", 
+             plot.margin = margin_fix),  # p3 already has facet header
+  labels = c("A", "B", "C"),
+  ncol = 3
+)
+
+row2 <- plot_grid(
+  p2 + theme(legend.position = "none", plot.margin = margin_fix),
+  p4 + theme(legend.position = "none", plot.margin = margin_fix),
+  labels = c("D", "E"),
+  ncol = 2,
+  rel_widths = c(1.05, 1)  
+)
+
+p_combined <- plot_grid(row1, row2, ncol = 1, rel_heights = c(1, 1))
+
+quartz(file = "plots/Fig2.pdf",
+       type = "pdf",
+       width = 17.8 / 2.54,
+       height = 13 / 2.54)
+
+print(p_combined)
+
+dev.off()
+```
+
+### Supplemental Fig 1
+```{r}
+## Supplementary Info plots
+total_by_species_region_site <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species, Region_name, Site) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+total_by_species_region_strata <- outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 1) %>%
+  group_by(Species, Region_name, STRATA) %>%
+  summarise(total_n = n_distinct(ColonyNumber), .groups = "drop")
+
+p_all_sites_data <- cumulative_filled %>%
+  group_by(Species, Region_name, Site, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species_region_site, by = c("Species", "Region_name", "Site")) %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin(c("Species", "Region_name", "Site"))
+
+p_all_sites <- ggplot(p_all_sites_data,
+                      aes(x = Days_MI, y = cumulative_proportion, color = Species)) +
+  geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(-0.05, 1.05),
+                   labels = scales::percent_format(),
+                   breaks = c(0, 0.25, 0.5, 0.75, 1.0)) +
+  scale_color_manual(values = species_colors) +
+  facet_wrap(~Region_name + Site, ncol = 4) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence") +
+  theme_pnas() +
+  theme(legend.text = element_text(face = "italic"))
+
+p_region_strata_data <- cumulative_filled %>%
+  group_by(Species, Region_name, STRATA, Days_MI) %>%
+  summarise(n_predated = sum(Cumulative_Predation == "1", na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(total_by_species_region_strata,
+            by = c("Species", "Region_name", "STRATA")) %>%
+  mutate(cumulative_proportion = n_predated / total_n) %>%
+  add_origin(c("Species", "Region_name", "STRATA"))
+
+p_region_strata <- ggplot(p_region_strata_data,
+                           aes(x = Days_MI, y = cumulative_proportion, color = Species)) +
+  geom_smooth(se = FALSE, linewidth = 0.5, method = "gam",
+            formula = y ~ s(x, bs = "cs")) +
+  scale_y_continuous(limits = c(-0.05, 1.05),
+                   labels = scales::percent_format(),
+                   breaks = c(0, 0.25, 0.5, 0.75, 1.0)) +
+  scale_color_manual(values = species_colors) +
+  facet_wrap(~Region_name + STRATA, ncol = 2) +
+  labs(x = "Days post-outplanting", y = "Cumulative predation occurrence") +
+  theme_pnas() +
+  theme(legend.text = element_text(face = "italic"))
+
+ggsave("plots/Manuscript Figures/cumulative_predation_by_region_site_species.tiff",
+       plot = p_all_sites,
+       width = 17.8, height = 20, units = "cm",
+       dpi = 600, compression = "lzw",
+       device = ragg::agg_tiff)
+
+ggsave("plots/Manuscript Figures/cumulative_predation_by_region_strata_species.tiff",
+       plot = p_region_strata,
+       width = 17.8, height = 20, units = "cm",
+       dpi = 600, compression = "lzw",
+       device = ragg::agg_tiff)
+```
+
+
+
+### Proportions at last monitoring interval
+```{r}
+p_final <- outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  group_by(Species, Region_name) %>% 
+  summarize(prop_yes = mean(Cumulative_Predation== "1"), pred_se = std.error(Cumulative_Predation== "1")) %>% 
+  ggplot(., aes(x=Region_name, y=prop_yes, color=Species)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2) +
+  geom_errorbar(aes(ymin=prop_yes - pred_se, ymax=prop_yes + pred_se), width=0.2, position = position_dodge(width = 0.5), linewidth = 0.3) +
+  theme_pnas() +
+  ylab("Cumulative Predation Occurrence") +
+  xlab("Region") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic")
+  ) +
+  scale_color_manual(values = species_colors)
+
+ggsave("plots/predation_occurrence_final_by_region_species.tiff", plot = p_final,
+       width = 17.8, height = 8, units = "cm",
+       dpi = 600, compression = "lzw")
+```
+
+
+## Fig 2B-D stats
+```{r}
+# prep data
+outplant_monitoring_days_survival_glm %>%
+  filter(MI_CORRECTED == 25) -> end_of_study_data
+
+# Species-specific subsets
+end_of_study_data %>% filter(Species == "M. cavernosa") -> end_MCAV
+end_of_study_data %>% filter(Species == "O. faveolata")  -> end_OFAV
+end_of_study_data %>% filter(Species == "P. clivosa")    -> end_PCLI
+
+# Fig 2B-D: Cumulative Predation Prevalence at end of study
+
+# Cumulative predation prevalence at end of study (all species) 
+# Best model: Species + Region + STRATA, no interactions (AIC 863.6)
+# Note: Region*STRATA model (AIC 853.8) has complete separation for Broward-Miami inshore corals — excluded for this reason
+
+glmm_cumulative_end <- glmmTMB(
+  Cumulative_Predation ~ Species + Region + STRATA + (1|Region:Site),
+  family = binomial(link = "logit"),
+  data = end_of_study_data
+)
+summary(glmm_cumulative_end)
+# AIC 863.6 
+
+sim_res_cumulative_end <- simulateResiduals(glmm_cumulative_end)
+plot(sim_res_cumulative_end)
+
+glmm_cumulative_end_anova <- Anova(glmm_cumulative_end, type = "II")
+print(glmm_cumulative_end_anova)
+
+# Post-hoc: regional pairwise comparisons
+glmm_cumulative_end_region_pairs <- emmeans(
+  glmm_cumulative_end, pairwise ~ Region, adjust = "tukey"
+)
+print(glmm_cumulative_end_region_pairs$contrasts)
+
+# Export
+export_glmm(glmm_cumulative_end,
+            "M1_cumulative_prevalence_all_species",
+            "pairwise ~ Region")
+```
+
+
+## Fig 2E stats - Source nursery effect on cumulative predation prevalence 
+```{r}
+# MCAV: no significant effect of source nursery - not exported 
+# source nursery
+glmm_cumulative_end_MCAV <- glmmTMB(Cumulative_Predation ~ SourceNursery + (1|Region:Site), 
+                                    family = binomial(link = "logit"), data = end_MCAV)
+summary(glmm_cumulative_end_MCAV)
+# AIC 203.6
+
+# region + strata + source nursery
+glmm_cumulative_end_MCAV <- glmmTMB(Cumulative_Predation ~ Region+STRATA+SourceNursery + (1|Region:Site), 
+                                    family = binomial(link = "logit"), data = end_MCAV)
+summary(glmm_cumulative_end_MCAV)
+# AIC 175.1
+
+# region + strata + source nursery
+glmm_cumulative_end_MCAV <- glmmTMB(Cumulative_Predation ~ Region+SourceNursery + (1|Region:Site), 
+                                    family = binomial(link = "logit"), data = end_MCAV)
+summary(glmm_cumulative_end_MCAV)
+# AIC 178.3
+
+# region*strata + source nursery
+glmm_cumulative_end_MCAV <- glmmTMB(Cumulative_Predation ~ Region*STRATA+SourceNursery + (1|Region:Site), 
+                                    family = binomial(link = "logit"), data = end_MCAV)
+summary(glmm_cumulative_end_MCAV)
+# AIC 178.3
+# no export for Supplementary Info because not significant
+```
+
+```{r}
+# OFAV: best model Region*STRATA + SourceNursery (AIC 470.8)
+
+glmm_cumulative_end_OFAV <- glmmTMB(
+  Cumulative_Predation ~ Region * STRATA + SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"),
+  data = end_OFAV
+)
+summary(glmm_cumulative_end_OFAV) #AIC 470.8
+
+sim_res_cumulative_OFAV <- simulateResiduals(glmm_cumulative_end_OFAV)
+plot(sim_res_cumulative_OFAV)
+
+glmm_cumulative_OFAV_anova <- Anova(glmm_cumulative_end_OFAV, type = "II")
+print(glmm_cumulative_OFAV_anova)
+
+glmm_cumulative_OFAV_nursery_pairs <- emmeans(
+  glmm_cumulative_end_OFAV, pairwise ~ SourceNursery, adjust = "tukey"
+)
+print(glmm_cumulative_OFAV_nursery_pairs$contrasts)
+
+# Export
+export_glmm(glmm_cumulative_end_OFAV,
+            "M2_cumulative_prevalence_OFAV_sourcenursery",
+            "pairwise ~ SourceNursery")
+```
+
+
+```{r}
+# PCLI: no significant effect of source nursery - not exported
+
+# source nursery
+glmm_cumulative_end_PCLI <- glmmTMB(Cumulative_Predation ~ SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"), 
+  data = end_PCLI)
+summary(glmm_cumulative_end_PCLI)
+# AIC 259.5
+
+# region + strata + source nursery
+glmm_cumulative_end_PCLI <- glmmTMB(Cumulative_Predation ~ Region+STRATA+SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"), 
+  data = end_PCLI)
+summary(glmm_cumulative_end_PCLI)
+# AIC 227.1
+
+# region x strata + source nursery
+glmm_cumulative_end_PCLI <- glmmTMB(Cumulative_Predation ~ Region*STRATA+SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"), 
+  data = end_PCLI)
+summary(glmm_cumulative_end_PCLI)
+# AIC 225.8
+
+# region + source nursery
+glmm_cumulative_end_PCLI <- glmmTMB(Cumulative_Predation ~ Region+SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"), 
+  data = end_PCLI)
+summary(glmm_cumulative_end_PCLI)
+# AIC 225.5
+
+# strata + source nursery
+glmm_cumulative_end_PCLI <- glmmTMB(Cumulative_Predation ~ STRATA+SourceNursery + (1|Region:Site),
+  family = binomial(link = "logit"), 
+  data = end_PCLI)
+summary(glmm_cumulative_end_PCLI)
+# AIC 261.3
+```
+
+
+# Figure 3: Predation Intensity
+```{r}
+# summary of predation intensity
+outplant_monitoring_days_survival_glm %>% 
+  mutate(PRED_1 = PRED_1*100) %>% 
+  group_by(Species) %>% 
+  filter(PRED_1 > 0) %>% 
+  summarise(mean_predation = mean(PRED_1), median_predation = median(PRED_1), sd_predation = sd(PRED_1), se_predation = std.error(PRED_1))
+
+
+# first 30 days
+outplant_monitoring_days_survival_glm %>% 
+  mutate(PRED_1 = PRED_1*100) %>% 
+  filter(Days_MI < 30) %>%
+  group_by(Species) %>% 
+  filter(PRED_1 > 0) %>% 
+  summarise(mean_predation = mean(PRED_1), median_predation = median(PRED_1), sd_predation = sd(PRED_1), se_predation = std.error(PRED_1))
+```
+
+
+
+```{r}
+# species x region - mean over first month
+p1<-outplant_monitoring_days_survival_glm %>%
+  mutate(PRED_1 = PRED_1*100) %>%
+  filter(Days_MI < 30) %>% 
+  group_by(Species, Region_name) %>%
+  summarise(mean_predation = mean(PRED_1), pred_sd = sd(PRED_1), pred_se = std.error(PRED_1), sample_size = n()) %>% 
+ggplot(., aes(x=Region_name, y=mean_predation, color=Species)) +
+  geom_point(position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin=mean_predation - pred_se, ymax=mean_predation + pred_se), width=0.2, position = position_dodge(width = 0.3)) +
+  theme_classic() +
+  ylab("Predation Intensity") +
+  xlab("Strata") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=14)
+  ) +
+  scale_color_manual(values = species_colors)
+
+# source nursery - mean over first month
+p2<- outplant_monitoring_days_survival_glm %>%
+  mutate(PRED_1 = PRED_1*100) %>%
+  filter(Days_MI < 30) %>% 
+  group_by(Species, SourceNursery) %>%
+  summarise(mean_predation = mean(PRED_1), pred_sd = sd(PRED_1), pred_se = std.error(PRED_1), sample_size = n()) %>% 
+ggplot(., aes(x=Species, y=mean_predation, color=SourceNursery)) +
+  geom_point(position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin=mean_predation - pred_se, ymax=mean_predation + pred_se), width=0.2, position = position_dodge(width = 0.5)) +
+  theme_classic() +
+  ylab("Predation Intensity") +
+  xlab("Species") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"),
+    text = element_text(size=14)
+  ) +
+  scale_color_manual(values = source_nursery_colors) +
+  labs(color = "Source Nursery") +
+  ylim(0,15)
+
+plot_grid(p1,
+          p2,
+          labels = c("A", "B"),
+          ncol = 1,
+          align = 'v')
+#ggsave("plots/Manuscript Figures/Fig3_unedited.pdf", width = 10, height = 8)
+```
+
+## Fig 3 stats
+
+### Fig 3A
+```{r}
+# First 30 days subsets
+outplant_monitoring_days_survival_glm %>%
+  filter(Days_MI < 30) -> first_30_days_data
+
+first_30_days_data$obs_id <- 1:nrow(first_30_days_data)
+# try adding this as a random effect to help with dispersion
+
+first_30_days_data %>% filter(Species == "M. cavernosa") -> first_30_MCAV
+first_30_days_data %>% filter(Species == "O. faveolata")  -> first_30_OFAV
+first_30_days_data %>% filter(Species == "P. clivosa")    -> first_30_PCLI
+
+# Predation intensity in first 30 days — all species
+# Best model: Species + Region, zi ~ Species + Region (AIC -73.0)
+
+glmm_intensity_30 <- glmmTMB(
+  PRED_1 ~ Species + Region + (1|Region:Site) + (1|Days_MI) + (1|ColonyNumber) + (1|obs_id),
+  family = beta_family(),
+  ziformula = ~ Species + Region,
+  data = first_30_days_data
+)
+summary(glmm_intensity_30)
+
+sim_res_intensity_30 <- simulateResiduals(glmm_intensity_30)
+plot(sim_res_intensity_30)
+
+glmm_intensity_30_anova <- Anova(glmm_intensity_30, type = "II")
+print(glmm_intensity_30_anova)
+
+glmm_intensity_30_species_pairs <- emmeans(
+  glmm_intensity_30, pairwise ~ Species, adjust = "tukey"
+)
+print(glmm_intensity_30_species_pairs$contrasts)
+
+# Export
+export_glmm(glmm_intensity_30,
+            "M3_predation_intensity_30days_all_species",
+            "pairwise ~ Species")
+```
+
+### Fig 3B
+```{r}
+# MCAV source nursery 
+# Best model: SourceNursery only, zi ~ Region (AIC 70.7)
+
+glmm_intensity_30_MCAV <- glmmTMB(
+  PRED_1 ~ SourceNursery + (1|Region:Site) + (1|Days_MI) + (1|ColonyNumber),
+  family = beta_family(),
+  ziformula = ~ Region,
+  data = first_30_MCAV
+)
+summary(glmm_intensity_30_MCAV)
+
+sim_res_intensity_MCAV <- simulateResiduals(glmm_intensity_30_MCAV)
+plot(sim_res_intensity_MCAV)
+
+glmm_intensity_MCAV_anova <- Anova(glmm_intensity_30_MCAV, type = "II")
+print(glmm_intensity_MCAV_anova)
+
+glmm_intensity_MCAV_pairs <- emmeans(
+  glmm_intensity_30_MCAV, pairwise ~ SourceNursery, adjust = "tukey"
+)
+print(glmm_intensity_MCAV_pairs$contrasts)
+
+# Export
+export_glmm(glmm_intensity_30_MCAV,
+            "M4_predation_intensity_30days_MCAV",
+            "pairwise ~ SourceNursery")
+```
+
+
+```{r}
+# OFAV source nursery 
+# Best model: Region + STRATA + SourceNursery, zi ~ Region + STRATA + SourceNursery
+# (AIC -217.1)
+
+# need obs id to reduce dispersion
+first_30_OFAV$obs_id <- 1:nrow(first_30_OFAV)
+
+glmm_intensity_30_OFAV <- glmmTMB(
+  PRED_1 ~ Region + STRATA + SourceNursery +
+    (1|Region:Site) + (1|Days_MI) + (1|ColonyNumber) + (1|obs_id),
+  family = beta_family(),
+  ziformula = ~ Region + STRATA + SourceNursery,
+  data = first_30_OFAV
+)
+
+summary(glmm_intensity_30_OFAV)
+
+sim_res_intensity_OFAV <- simulateResiduals(glmm_intensity_30_OFAV)
+plot(sim_res_intensity_OFAV)
+
+glmm_intensity_OFAV_anova <- Anova(glmm_intensity_30_OFAV, type = "II")
+print(glmm_intensity_OFAV_anova)
+
+glmm_intensity_OFAV_pairs <- emmeans(
+  glmm_intensity_30_OFAV, pairwise ~ SourceNursery, adjust = "tukey"
+)
+print(glmm_intensity_OFAV_pairs$contrasts)
+
+# Export
+export_glmm(glmm_intensity_30_OFAV,
+            "M5_predation_intensity_30days_OFAV",
+            "pairwise ~ SourceNursery")
+```
+
+
+```{r}
+# PCLI source nursery
+# Best model: SourceNursery only, zi ~ Region + SourceNursery (AIC 44.0)
+
+glmm_intensity_30_PCLI <- glmmTMB(
+  PRED_1 ~ SourceNursery + (1|Region:Site) + (1|Days_MI) + (1|ColonyNumber),
+  family = beta_family(),
+  ziformula = ~ Region + SourceNursery,
+  data = first_30_PCLI
+)
+summary(glmm_intensity_30_PCLI)
+
+sim_res_intensity_PCLI <- simulateResiduals(glmm_intensity_30_PCLI)
+plot(sim_res_intensity_PCLI)
+
+glmm_intensity_PCLI_anova <- Anova(glmm_intensity_30_PCLI, type = "II")
+print(glmm_intensity_PCLI_anova)
+
+glmm_intensity_PCLI_pairs <- emmeans(
+  glmm_intensity_30_PCLI, pairwise ~ SourceNursery, adjust = "tukey"
+)
+print(glmm_intensity_PCLI_pairs$contrasts)
+
+# Export
+export_glmm(glmm_intensity_30_PCLI,
+            "M6_predation_intensity_30days_PCLI",
+            "pairwise ~ SourceNursery")
+```
+
+
+## OFAV Genotypes
+
+```{r}
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == "1") %>% 
+  group_by(Species, Region, GenotypeName_Allyson) %>% 
+  summarise(count = n(), .groups = "drop") %>% 
+  filter(count >=3) %>% 
+  group_by(Species, GenotypeName_Allyson) %>% 
+  summarise(count = n()) %>% 
+  filter(count == 6) -> list_of_genotypes
+# this is the number of colonies with 3 replicates at each region
+
+arrange(list_of_genotypes, GenotypeName_Allyson)
+
+# there are no donor colonies represented at all 24 sites (4 per region, 6 regions)
+
+list_of_genotypes %>% 
+  dplyr::select(Species, GenotypeName_Allyson) %>% 
+  distinct() #21 total donor colonies across species
+
+list_of_genotypes %>% 
+  dplyr::select(Species, GenotypeName_Allyson) %>% 
+  distinct() %>% 
+  group_by(Species) %>% 
+  summarise(num_donor_colonies = n())
+#3 MCAV, 16 OFAV, 2 PCLI total 
+
+# can only look at OFAV 
+
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == "1") %>% 
+  group_by(Species, Region, GenotypeName_Allyson) %>% 
+  summarise(count = n(), .groups = "drop") %>% 
+  filter(count >=3) %>% 
+  group_by(Species, GenotypeName_Allyson) %>% 
+  summarise(count = n()) %>% 
+  filter(count == 6) %>% 
+  filter(Species == "O. faveolata") -> list_of_genotypes
+```
+
+
+```{r}
+semi_join(outplant_monitoring_days_survival_glm, list_of_genotypes, by = c("GenotypeName_Allyson")) -> donor_colony_data
+
+donor_colony_data %>% 
+  filter(MI_CORRECTED == 1) %>% 
+  group_by(Species, GenotypeName_Allyson) %>% 
+  summarise(count = n()) #16 genotypes, this matches
+
+donor_colony_data %>% 
+  filter(MI_CORRECTED == 1) %>% 
+  group_by(Species, GenotypeName_Allyson, Region) %>% 
+  summarise(count = n()) # at least 3 replicates per region, all regions
+```
+
+### cumulative predation prevalence
+```{r}
+donor_colony_data %>% 
+  mutate(Cumulative_Predation = as.numeric(as.character(Cumulative_Predation))) %>% 
+ggplot(., aes(x=Days_MI, y=Cumulative_Predation, color=GenotypeName_Allyson)) +
+  geom_smooth(method = "loess", se = FALSE) +
+  theme_classic() +
+  ylab("Cumulative Predation Prevalence") +
+  xlab("Days Since Outplanting") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=14)
+  ) +
+  scale_color_viridis_d() +
+  facet_wrap(~Region_name)
+```
+
+```{r}
+donor_colony_data %>% 
+  filter(!(MI_CORRECTED == "2" & Region == "3")) %>% #removing MI 2 because the proportion of corals is messed up
+  group_by(Species, Region_name, Days_MI, Cumulative_Predation, GenotypeName_Allyson, SourceNursery) %>% 
+  summarise(count = n()) %>% 
+  pivot_wider(names_from = "Cumulative_Predation", values_from = "count") %>% 
+  ungroup() %>% 
+  mutate(across(c(`0`, `1`), ~ replace_na(.x, 0))) %>% 
+  mutate(total = `0` + `1`) %>% 
+  mutate(proportion_predation = `1`/total) %>% 
+  ggplot(., aes(x=Days_MI, y=proportion_predation, color=GenotypeName_Allyson)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(se=FALSE) +
+  theme_classic() +
+  ylab("Cumulative Predation Occurrence") +
+  xlab("Days Since Outplanting") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.text = element_text(face = "italic"),
+    text = element_text(size=14)
+  ) +
+  scale_color_viridis_d() +
+  facet_wrap(~Region_name+SourceNursery, ncol = 3) 
+#ggsave("plots/donor_colony_cumulative_predation_prevalence_OFAV.pdf", width = 10, height = 12)
+```
+
+### cumulative predation prevalence stats
+```{r}
+donor_colony_data %>% 
+  filter(!(MI_CORRECTED == "2" & Region == "3")) %>% 
+  filter(MI_CORRECTED == 25) %>% 
+  unite("Region_Site", Region, Site, sep = "_", remove = FALSE) -> end_of_study_OFAV_donor_colony_data
+
+# donor colony + region
+glmm_cumulative_end_OFAV_donorcolony <- glmmTMB(Cumulative_Predation ~ GenotypeName_Allyson+Region + (1|Region_Site), family = "binomial", data = end_of_study_OFAV_donor_colony_data)
+summary(glmm_cumulative_end_OFAV_donorcolony)
+# AIC 386.8
+
+Anova(glmm_cumulative_end_OFAV_donorcolony, type = "II")
+# no significant difference based on donor colony (p=0.08)
+emmeans(glmm_cumulative_end_OFAV_donorcolony, pairwise ~ GenotypeName_Allyson, adjust = "tukey")
+
+# source nursery + region
+glmm_cumulative_end_OFAV_donorcolony <- glmmTMB(Cumulative_Predation ~ SourceNursery+Region + (1|Region_Site), family = "binomial", data = end_of_study_OFAV_donor_colony_data)
+summary(glmm_cumulative_end_OFAV_donorcolony)
+# AIC 374.6
+
+Anova(glmm_cumulative_end_OFAV_donorcolony, type = "II")
+```
+
+### predation intensity
+```{r}
+donor_colony_data %>% 
+  mutate(PRED_1 = PRED_1*100) %>%
+  filter(Days_MI < 30) %>% 
+  group_by(GenotypeName_Allyson, SourceNursery) %>%
+  summarise(mean_predation = mean(PRED_1), pred_sd = sd(PRED_1), pred_se = std.error(PRED_1), sample_size = n()) %>% 
+ggplot(., aes(x=SourceNursery, y=mean_predation, color=GenotypeName_Allyson)) +
+  geom_point(position = position_dodge(width=0.2)) +
+  geom_errorbar(aes(ymin=mean_predation - pred_se, ymax=mean_predation + pred_se), width=0.2, position = position_dodge(width=0.2)) +
+  theme_classic() +
+  ylab("Predation Intensity (%)") +
+  xlab("Source Nursery") +
+  labs(color = "Donor Colony") +
+  theme(
+    legend.position = "bottom",
+    text = element_text(size=14)
+  ) 
+ggsave("plots/Manuscript Figures/FigS2.pdf", width = 8, height = 6)
+```
+
+
+### predation intensity stats
+```{r}
+# Donor colony effect on OFAV predation intensity (first 30 days) 
+# Only OFAV has sufficient replication (16 donor colonies, ≥3 bases per region)
+
+outplant_monitoring_days_survival_glm %>%
+  filter(Days_MI < 30) %>%
+  semi_join(list_of_genotypes, by = "GenotypeName_Allyson") -> first_30_OFAV_donor
+
+glmm_intensity_30_OFAV_donor <- glmmTMB(
+  PRED_1 ~ Region + GenotypeName_Allyson + (1|Region:Site) + (1|Days_MI),
+  family = beta_family(),
+  ziformula = ~ Region,
+  data = first_30_OFAV_donor
+)
+summary(glmm_intensity_30_OFAV_donor)
+
+sim_res_intensity_OFAV_donor <- simulateResiduals(glmm_intensity_30_OFAV_donor)
+plot(sim_res_intensity_OFAV_donor)
+
+glmm_intensity_OFAV_donor_anova <- Anova(glmm_intensity_30_OFAV_donor, type = "II")
+print(glmm_intensity_OFAV_donor_anova)
+
+glmm_intensity_OFAV_donor_pairs <- emmeans(
+  glmm_intensity_30_OFAV_donor, pairwise ~ GenotypeName_Allyson, adjust = "tukey"
+)
+print(glmm_intensity_OFAV_donor_pairs$contrasts)
+
+# Export
+export_glmm(glmm_intensity_30_OFAV_donor,
+            "M7_predation_intensity_30days_OFAV_donorcolony",
+            "pairwise ~ GenotypeName_Allyson")
+```
+
+
+# Figure 4: Survivorship vs Predation Intensity
+
+Model survivorship versus predation intensity for a given species x strata (since strata was a significant predictor variable for survivorship, but not region)
+
+```{r}
+outplant_monitoring_days_survival_glm %>% 
+  filter(Days_MI == "28") %>% 
+  dplyr::select(Region:SourceNursery, STRATA, ColonyNumber, PRED_1) -> predation_intensity_30days
+
+outplant_monitoring_days_survival_glm %>% 
+  filter(MI_CORRECTED == "25") %>% 
+  dplyr::select(Region:SourceNursery, STRATA, ColonyNumber, Survival) -> end_of_study_survivorship
+
+full_join(end_of_study_survivorship, predation_intensity_30days, by = c("Region", "Region_name", "Site", "Species", "STRATA", "SourceNursery", "ColonyNumber")) -> surv_vs_predation_30days
+
+# glmm 
+species_model <- glmmTMB(
+  Survival ~ PRED_1*Species + STRATA + (1|Region:Site),
+  data = surv_vs_predation_30days,
+  family = binomial(link = "logit")
+)
+summary(species_model) # AIC 1108.7
+# residual diagnostics (DHARMA)
+sim_res_species_model <- simulateResiduals(species_model)
+plot(sim_res_species_model)
+
+# Sensitivity check: does PRED_1*Species survive with Region as fixed effect?
+species_model_region_check <- glmmTMB(
+  Survival ~ PRED_1 * Species + STRATA + Region + (1|Region:Site),
+  family = binomial(link = "logit"),
+  data   = surv_vs_predation_30days
+)
+summary(species_model_region_check)
+# If PRED_1*Species slopes remain significant → result is robust
+# Report both AIC and slope stability in methods
+
+# 1. Do slopes remain significant and in the same direction?
+slopes_region_check <- emtrends(species_model_region_check, ~ Species,
+                                 var = "PRED_1", infer = TRUE)
+print(slopes_region_check)
+
+# 2. Are the slopes similar in magnitude to the original model?
+slopes_original <- emtrends(species_model, ~ Species,
+                             var = "PRED_1", infer = TRUE)
+
+comparison <- bind_rows(
+  as.data.frame(slopes_original) %>% mutate(model = "Without Region"),
+  as.data.frame(slopes_region_check) %>% mutate(model = "With Region")
+)
+
+print(comparison)
+
+# 3. AIC comparison
+AIC(species_model, species_model_region_check)
+``` 
+
+```{r}
+# Create full prediction grid with all strata
+pred_grid_full <- expand.grid(
+  PRED_1 = seq(min(surv_vs_predation_30days$PRED_1, na.rm = TRUE),
+               max(surv_vs_predation_30days$PRED_1, na.rm = TRUE),
+               length.out = 100),
+  Species = unique(surv_vs_predation_30days$Species),
+  STRATA = unique(surv_vs_predation_30days$STRATA)
+)
+
+# Generate predictions
+pred_grid_full$predicted_prob <- predict(species_model,
+                                         newdata = pred_grid_full,
+                                         type = "response",
+                                         re.form = NA)
+
+# Average across strata (marginal predictions)
+pred_grid <- pred_grid_full %>%
+  group_by(Species, PRED_1) %>%
+  summarise(predicted_prob = mean(predicted_prob), .groups = "drop")
+
+# Plot
+p_surv <- ggplot() +
+  geom_point(data = surv_vs_predation_30days,
+             aes(x = PRED_1, y = Survival, color = Species), size = 1.5, alpha = 0.5) +
+  geom_line(data = pred_grid,
+            aes(x = PRED_1, y = predicted_prob, color = Species),
+            linewidth = 0.4) +
+  labs(x = "Predation Intensity at 30 Days",
+       y = "End of Study Survivorship",
+       color = "Species") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_pnas() +
+  scale_color_manual(values = species_colors) +
+  theme(
+    legend.text = element_text(face = "italic")
+  )
+
+ggsave("plots/Fig4.tiff", plot = p_surv,
+       width = 8.7, height = 8, units = "cm",
+       dpi = 600, compression = "lzw")
+```
+
+## Stats
+```{r}
+glmm_intensity_30_species_anova <- Anova(species_model, type = "II")
+#significant effect of Species, strata, and pred_1 x species
+# as.data.frame(glmm_intensity_30_species_anova) %>%
+#   rownames_to_column(var = "Term") %>%
+#   write_csv("species_strata_predation_intensity_anova_results.csv")
+
+glmm_intensity_30_species_pred_pairs <- emmeans(species_model, pairwise ~ Species*PRED_1, adjust = "tukey")
+
+#write.csv(as.data.frame(glmm_intensity_30_species_pred_pairs$contrasts), "emmeans_contrasts_predation_intensity_species_pred.csv", row.names = FALSE)
+
+# Get the effect of PRED_1 for each species
+slopes_by_species <- emtrends(species_model, 
+                              ~ Species, 
+                              var = "PRED_1",
+                              infer = TRUE)  # Add confidence intervals
+print(slopes_by_species)
+
+# Test if slopes differ significantly between species
+slopes_contrasts <- pairs(slopes_by_species)
+print(slopes_contrasts)
+
+# Export
+export_glmm(species_model,
+            "M8_survivorship_vs_predation_intensity",
+            "pairwise ~ Species")
+
+as.data.frame(slopes_by_species) %>%
+  write_csv("SI_tables/M8_survivorship_slopes_by_species.csv")
+
+as.data.frame(slopes_contrasts) %>%
+  write_csv("SI_tables/M8_survivorship_slopes_contrasts.csv")
+
+```
+
+
+# Predation Index (Table 1)
+
+Assess early predation rate (by day 30) and intensity (max predation observed) for each region, then calculate a predation index as the product of prevalence and intensity. Rank regions by this index.
+
+```{r}
+regions <- unique(outplant_monitoring_days_survival_glm$Region)
+
+min(outplant_monitoring_days_survival_glm$PRED_1) #0
+max(outplant_monitoring_days_survival_glm$PRED_1) #0.9 
+# scaled 0-1 as a proportion 
+
+# Create empty dataframe to store results
+PredationIndex <- data.frame(
+  Region = character(),
+  Region_name = character(),
+  Prevalence = numeric(),
+  Intensity = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each region
+for (region in regions) {
+  
+  # Filter to this specific region
+  region_data <- outplant_monitoring_days_survival_glm %>%
+    filter(Region == region)
+  
+  # Get region name
+  region_name <- unique(region_data$Region_name)[1]
+  
+  # Calculate Prevalence: average across species (equal weight per species)
+  final_obs <- region_data %>%
+    group_by(Species, ColonyNumber) %>%
+    slice_max(Days_MI, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  species_prev <- final_obs %>%
+    group_by(Species) %>%
+    summarise(
+      Prev = mean(Cumulative_Predation == "1"),
+      N = n()
+    )
+  
+  prevalence <- mean(species_prev$Prev)
+  
+  # Calculate Intensity: average across species (equal weight per species)
+  max_per_coral <- region_data %>%
+    filter(Experienced_Predation == "1") %>%
+    group_by(Species, ColonyNumber) %>%
+    summarise(MaxPred = max(PRED_1, na.rm = TRUE), .groups = "drop")
+  
+  species_intensity <- max_per_coral %>%
+    group_by(Species) %>%
+    summarise(
+      MedianIntensity = median(MaxPred, na.rm = TRUE),
+      N_predated = n()
+    )
+  
+  if(nrow(species_intensity) > 0) {
+    intensity <- mean(species_intensity$MedianIntensity)
+  } else {
+    intensity <- 0
+  }
+  
+  # Add results to dataframe
+  PredationIndex <- rbind(
+    PredationIndex,
+    data.frame(
+      Region = region,
+      Region_name = region_name,
+      Prevalence = prevalence,
+      Intensity = intensity
+    )
+  )
+}
+
+# Calculate index and rank
+PredationIndex <- PredationIndex %>%
+  mutate(
+    Index = Prevalence * Intensity,
+    Rank = rank(-Index)
+  ) %>%
+  arrange(Rank)
+
+print(PredationIndex)
+
+write_csv(PredationIndex, "Predation_Index_by_Region.csv")
+```
+
