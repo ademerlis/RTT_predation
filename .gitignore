@@ -1,3 +1,5 @@
 archive/
 .DS_Store
 0_tidying_original_data.Rmd
+input_files/
+results/SI_tables
